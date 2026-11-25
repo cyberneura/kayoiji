@@ -170,6 +170,11 @@ impl Detector {
         }
         let parsed = RomajiTable::global().parse(buffer);
         if !parsed.is_strict() {
+            // "wi" のような外来語用の綴りでも、日本語として覚えた単語の途中なら単語の区切りまで待つ。
+            // ここで英語に決めると、区切りで覚えた単語と照合する前に単語が終わる。
+            if has_word_starting_with(&self.japanese_words, buffer) {
+                return Verdict::Undetermined;
+            }
             return Verdict::English;
         }
         if parsed.converted_count() < self.config.min_kana_mid_word {
@@ -560,6 +565,23 @@ pub(crate) mod tests {
         assert_eq!(detector.evaluate_word("tatoe", Context::Neutral), Verdict::English);
         // 日本語の入力が続いている間は、その間に訂正していないので規則のまま。
         assert_eq!(detector.evaluate_prefix("tatoe", Context::AfterJapanese), Verdict::Japanese);
+    }
+
+    #[test]
+    fn a_learned_japanese_word_is_kept_open_even_in_a_rare_spelling() {
+        // Arrange
+        let mut detector = sample_detector();
+        // "wi" は「うぃ」と読めるが、一般的なローマ字ではないので英語に決まる。
+        assert_eq!(detector.evaluate_prefix("wi", Context::Neutral), Verdict::English);
+
+        // Act
+        detector.learn("wi", Language::Japanese, false);
+
+        // Assert
+        assert_eq!(detector.evaluate_prefix("wi", Context::Neutral), Verdict::Undetermined);
+        assert_eq!(detector.evaluate_word("wi", Context::Neutral), Verdict::Japanese);
+        // 覚えた単語から外れた打鍵列は、これまでどおり英語。
+        assert_eq!(detector.evaluate_prefix("win", Context::Neutral), Verdict::English);
     }
 
     #[test]

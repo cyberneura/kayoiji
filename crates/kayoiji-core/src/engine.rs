@@ -1274,6 +1274,22 @@ mod tests {
     }
 
     #[test]
+    fn force_japanese_is_remembered_for_a_rare_spelling() {
+        // Arrange
+        let mut simulator = simulator();
+        // "wi" は一般的なローマ字ではないので、打った時点で英語に決まる。
+        simulator.run("wi {ja}{enter} ");
+        let learned = simulator.text.clone();
+
+        // Act
+        simulator.run("wi ");
+
+        // Assert
+        assert_eq!(learned, "うぃ ");
+        assert_eq!(simulator.text, "うぃ うぃ");
+    }
+
+    #[test]
     fn force_japanese_without_a_word_passes_the_key_through() {
         // Arrange
         let mut simulator = simulator();

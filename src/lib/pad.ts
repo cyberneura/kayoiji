@@ -128,6 +128,23 @@ function typed(before: string, key: PadKey): string {
 }
 
 /**
+ * 利用者がテキストエリアを直接編集していたら (貼り付けなど)、編集後の内容を返す。
+ * していなければ `text` をそのまま返す。
+ *
+ * エンジンの応答を待つ間の編集は、こちらが持っているテキストには入っていない。そのまま応答を
+ * 表示すると、編集を古い内容で上書きしてしまう。
+ */
+export function adoptNativeEdit(
+  text: PadText,
+  value: string,
+  selectionStart: number,
+  selectionEnd: number
+): PadText {
+  if (value === text.before + text.preedit + text.after) return text;
+  return { before: value.slice(0, selectionStart), preedit: '', after: value.slice(selectionEnd) };
+}
+
+/**
  * エンジンの出力をテキストに適用する。`key` は出力の元になったキーで、
  * エンジンが消費しなかった時はキー本来の編集を行う。
  */

@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import {
+    adoptNativeEdit,
     applyOutput,
     commitPreedit,
     keyFromEvent,
@@ -78,6 +79,9 @@
   }
 
   function receive(response: PadResponse, key: PadKey | null) {
+    if (textarea) {
+      text = adoptNativeEdit(text, textarea.value, textarea.selectionStart, textarea.selectionEnd);
+    }
     text = applyOutput(text, response, key);
     focus = response.focus;
     view = response.view;

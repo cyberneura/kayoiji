@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  adoptNativeEdit,
   applyOutput,
   commitPreedit,
   keyFromEvent,
@@ -76,6 +77,25 @@ describe('keyFromEvent', () => {
   it('does not treat a held letter as a word outside a composition', () => {
     expect(keyFromEvent(event('a', { repeat: true }), 'direct')).toBeNull();
     expect(keyFromEvent(event('a', { repeat: true }), 'composing')).toEqual({ type: 'char', value: 'a' });
+  });
+});
+
+describe('adoptNativeEdit', () => {
+  it('keeps the text when the textarea shows what was rendered', () => {
+    const text: PadText = { before: 'ab', preedit: 'にほん', after: 'z' };
+    expect(adoptNativeEdit(text, 'abにほんz', 2, 5)).toBe(text);
+  });
+
+  it('continues from a paste made while a response was pending', () => {
+    // 'c' の応答を待つ間に、"ab" の後ろへ "XYZ" を貼り付けた。
+    const text: PadText = { before: 'ab', preedit: '', after: '' };
+    const passed = { consumed: false, delete_before: 0, commit: '', preedit: '', focus: null };
+
+    const adopted = adoptNativeEdit(text, 'abXYZ', 5, 5);
+
+    expect(adopted).toEqual({ before: 'abXYZ', preedit: '', after: '' });
+    // 応答を適用しても、貼り付けた文字列は残る。
+    expect(applyOutput(adopted, passed, { type: 'char', value: 'c' }).before).toBe('abXYZc');
   });
 });
 

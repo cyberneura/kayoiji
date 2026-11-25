@@ -1,0 +1,14 @@
+[package]
+name = "kayoiji-cli"
+description = "Builds Kayoiji's dictionaries and exercises the engine from a terminal"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kayoiji-cli"
+path = "src/main.rs"
+
+[dependencies]
+kayoiji-core.workspace = true
+clap = { version = "4", features = ["derive"] }

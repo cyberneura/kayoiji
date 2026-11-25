@@ -1,0 +1,4 @@
+menu:
+  - title: Install locally (~/Library/Input Methods)
+    shell: ./scripts/install-macos.sh
+    help: Build Kayoiji and install it as this user's input method. An installed one is replaced and restarted.

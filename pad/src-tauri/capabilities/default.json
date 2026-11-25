@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "テキストエリアのウインドウは、アプリのコマンド呼び出しだけを行う",
+  "windows": ["pad"],
+  "permissions": ["core:default"]
+}

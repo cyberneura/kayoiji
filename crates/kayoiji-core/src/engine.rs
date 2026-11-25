@@ -824,13 +824,7 @@ impl Engine {
                 Step::commit(text)
             }
             Key::Backspace => {
-                let parsed = RomajiTable::global().parse(&raw);
-                let removed = match parsed.segments.last() {
-                    _ if !parsed.pending.is_empty() => 1,
-                    Some(segment) => segment.raw.len(),
-                    None => raw.len(),
-                };
-                raw.truncate(raw.len() - removed);
+                raw.truncate(raw.len() - backspace_len(&raw));
                 self.state = if raw.is_empty() {
                     State::Direct(Direct::at_boundary())
                 } else {
@@ -1080,6 +1074,28 @@ impl Engine {
             self.last_error = Some(error);
         }
     }
+}
+
+/// かなの入力中の Backspace で、打鍵列の末尾から消すバイト数。かな 1 文字分の打鍵を消す。
+fn backspace_len(raw: &str) -> usize {
+    let table = RomajiTable::global();
+    let parsed = table.parse(raw);
+    if !parsed.pending.is_empty() {
+        return 1;
+    }
+    let Some((last, kept)) = parsed.segments.split_last() else {
+        return raw.len();
+    };
+    if !last.raw.is_ascii() {
+        return last.raw.len();
+    }
+    // 促音の規則 ("kk" → っ + k) は、次のかなと打鍵を共有する。「がっか」の "ka" をすべて消すと
+    // "gak" になり、手前の「っ」まで消える。手前のかなが変わらない範囲で、できるだけ多く消す。
+    let kept: String = kept.iter().map(|segment| segment.out.as_str()).collect();
+    (1..=last.raw.len())
+        .rev()
+        .find(|length| table.parse(&raw[..raw.len() - length]).text() == kept)
+        .unwrap_or(last.raw.len())
 }
 
 /// 入力中の単語の続きとして、日本語の判定に含める文字かどうか。
@@ -1849,6 +1865,24 @@ mod tests {
         simulator.run("{bs}{bs}");
         assert_eq!(simulator.text, "");
         assert_eq!(simulator.engine.view().mode, Mode::Direct);
+    }
+
+    #[test]
+    fn backspace_after_a_doubled_consonant_keeps_the_small_tsu() {
+        // Arrange
+        let mut simulator = simulator();
+        simulator.run("{henkan}gakka");
+        assert_eq!(simulator.text, "がっか");
+
+        // Act
+        simulator.run("{bs}");
+        let after_backspace = simulator.text.clone();
+        simulator.run("i");
+
+        // Assert
+        // 「っ」は次のかなと "k" を共有しているので、"k" は残る。
+        assert_eq!(after_backspace, "がっk");
+        assert_eq!(simulator.text, "がっき");
     }
 
     #[test]

@@ -1,0 +1,33 @@
+# 判断データベース: 英語か日本語かを決め打ちする規則。
+#
+# 統計による判定より先に評価される。利用者は設定ディレクトリの rules.toml に同じ書式で
+# 規則を足せる (同じ文字列の規則は利用者側が優先)。
+#
+# [[rules]]
+#   sequence: 打鍵列。末尾が空白なら「単語の区切りで、その単語だった時」に確定する。
+#             空白で終わらなければ「単語の途中でも、打鍵列が一致した時点」で確定する。
+#   language: "english" または "japanese"
+#
+# [words]
+#   english:  単語の区切りで必ず英語にする単語。途中まで打った時点でも日本語と判定しない。
+#             日本語の入力が続いている間 (日本語を確定した直後) には適用しない。
+#             "nano" を「なの」、"kite" を「きて」と打つことがあるため。
+#   japanese: 単語の区切りで必ず日本語にする単語。
+
+[[rules]]
+sequence = "for "
+language = "english"
+
+[[rules]]
+sequence = "tatoe"
+language = "japanese"
+
+[words]
+# ローマ字として読め、統計だけでは日本語と判定されてしまうコマンド名・技術用語・英単語。
+english = [
+  "sudo", "nano", "kube", "deno", "bun", "node", "uname", "tee", "tauri", "mise", "hono", "wasi",
+  "fuga", "piyo", "todo", "noqa", "uri", "sata", "iso", "gui", "repo", "min", "pin", "meta",
+  "suno", "kiro", "memento", "ollama", "kappa", "omega", "kayoiji",
+  "non", "aka", "mega", "ate", "tore", "maze", "kite", "woo", "hen", "tango", "dana", "su", "hi", "nope",
+]
+japanese = []

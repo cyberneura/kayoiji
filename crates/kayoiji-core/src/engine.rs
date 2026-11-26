@@ -90,9 +90,9 @@ pub enum Key {
     ShiftLeft,
     /// Shift + 右矢印。変換中の文節を伸ばす。
     ShiftRight,
-    /// 変換キー (JIS 配列の「かな」)。直接入力なら、日本語入力か自動切り替えにする
-    /// (`EngineConfig::auto_switch`)。日本語入力の時は何もしない。自動切り替えの時は、かなを変換する。
-    /// 入力中でなければ、次の入力を日本語として始める。
+    /// 変換キー (JIS 配列の「かな」)。日本語入力か自動切り替えのうち、設定の側のモード
+    /// (`EngineConfig::auto_switch`) に入る。すでにそのモードなら、日本語入力の時は何もしない。
+    /// 自動切り替えの時は、かなを変換する。入力中でなければ、次の入力を日本語として始める。
     Henkan,
     /// 無変換キー (JIS 配列の「英数」)。直接入力にする。直接入力の時は何もしない。
     Muhenkan,
@@ -550,6 +550,10 @@ impl Engine {
         }
         if key == Key::Muhenkan {
             return self.set_input_mode(InputMode::Direct);
+        }
+        if key == Key::Henkan && self.input_mode != self.config.kana_key_mode() {
+            // 入力ソースの一覧で、設定と違う側のモードが選ばれている。「かな」は設定の側のモードに入る。
+            return self.set_input_mode(self.config.kana_key_mode());
         }
         if self.input_mode == InputMode::Japanese && key == Key::Henkan {
             // すでに日本語入力なので、何も変えない。
@@ -2472,6 +2476,22 @@ mod tests {
         // Assert
         assert_eq!(simulator.text, "きょうkyou ");
         assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn henkan_enters_the_configured_mode_from_the_other_japanese_side_mode() {
+        // Arrange: 自動切り替えは無効。入力ソースの一覧で、自動切り替えのモードが選ばれた
+        let mut simulator = simulator_with(false);
+        simulator.engine.set_input_mode(InputMode::Auto);
+        simulator.run("kyou");
+
+        // Act
+        simulator.run("{henkan}");
+
+        // Assert
+        // 入力中の文字列は、表示されているとおりに確定する。
+        assert_eq!(simulator.text, "きょう");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
     }
 
     #[test]

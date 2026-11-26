@@ -176,10 +176,11 @@ impl<'a> Lattice<'a> {
                 best: i32::MAX,
             });
             if let Some(phrases) = phrases {
-                let kana_end = (position..length)
+                // 覚えた語の読みより長い範囲は引かない。語を覚えていなければ、何も調べない。
+                let limit = (position + phrases.longest).min(length);
+                let kana_end = (position..limit)
                     .find(|&index| !is_kana(chars[index]))
-                    .unwrap_or(length)
-                    .min(position + phrases.longest);
+                    .unwrap_or(limit);
                 for end in position + 1..=kana_end {
                     let Some(phrase) = phrases.words.get(&reading[start_offset..offsets[end]]) else {
                         continue;

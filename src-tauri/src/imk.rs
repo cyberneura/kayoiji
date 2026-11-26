@@ -8,11 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kayoiji_core::engine::{Engine, InputMode, Key, Mode, Output, View};
+use kayoiji_core::engine::{Engine, EngineConfig, InputMode, Key, Mode, Output, View};
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, Sel};
 use objc2::{define_class, msg_send, sel, AllocAnyThread, ClassType, MainThreadMarker};
-use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSScreen};
+use objc2_app_kit::{
+    NSControlStateValueOn, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSScreen,
+};
 use objc2_foundation::{ns_string, NSAttributedString, NSBundle, NSNotFound, NSRange, NSRect, NSString};
 use objc2_input_method_kit::{IMKInputController, IMKServer};
 use tauri::AppHandle;
@@ -23,12 +25,13 @@ use crate::overlay::{self, Rect};
 /// Info.plist で、入力メソッドの接続名を指定するキー。
 const CONNECTION_NAME_KEY: &str = "InputMethodConnectionName";
 /// Info.plist の `ComponentInputModeDict` に書いた、入力モードの ID。メニューバーのアイコンはモードごとに決まる。
-const AUTO_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Japanese";
+/// 日本語入力と自動切り替えは、OS から見ると同じ入力モード。「かな」キーでどちらに入るかは設定で決まる。
+const JAPANESE_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Japanese";
 const DIRECT_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Roman";
 /// `setValue:forTag:client:` で、入力モードの切り替えを表すタグ (`kTextServiceInputModePropertyTag`、'imod')。
 const INPUT_MODE_TAG: isize = 0x696D_6F64;
 /// OS が入力モードを切り替えた直後に届く「かな」キーを、切り替えの一部とみなす時間。
-/// このキーを打鍵として扱うと、切り替えた直後に「次の入力を日本語にする」指定が入ってしまう。
+/// 自動切り替えでこのキーを打鍵として扱うと、切り替えた直後に「次の入力を日本語にする」指定が入ってしまう。
 const MODE_SWITCH_SETTLE: Duration = Duration::from_millis(300);
 
 struct Runtime {
@@ -100,37 +103,75 @@ define_class!(
 
         #[unsafe(method(showPreferences:))]
         fn show_preferences(&self, _sender: Option<&AnyObject>) {
-            show_settings();
+            show_window(crate::show_settings_window);
+        }
+
+        #[unsafe(method(showAbout:))]
+        fn show_about(&self, _sender: Option<&AnyObject>) {
+            show_window(crate::show_about_window);
+        }
+
+        #[unsafe(method(toggleAutoSwitch:))]
+        fn toggle_auto_switch(&self, _sender: Option<&AnyObject>) {
+            let Some(app) = app_handle() else {
+                return;
+            };
+            if let Err(error) = crate::toggle_auto_switch(&app) {
+                eprintln!("kayoiji: could not save the settings: {error}");
+            }
         }
     }
 );
 
+fn app_handle() -> Option<AppHandle> {
+    RUNTIME.with(|runtime| runtime.borrow().as_ref().map(|runtime| runtime.app.clone()))
+}
+
 /// 入力メニュー (メニューバーの入力ソースのメニュー) に足す項目。
+/// InputMethodKit は、項目のアクションをコントローラーへ届ける。
 fn input_menu() -> Option<Retained<NSMenu>> {
     let mtm = MainThreadMarker::new()?;
+    let app = app_handle()?;
     let menu = NSMenu::new(mtm);
-    // SAFETY: `showPreferences:` は、入力メニューの項目に対して InputMethodKit が
-    // コントローラーへ届けるアクション。
-    let item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            mtm.alloc(),
-            ns_string!("Kayoiji の設定…"),
-            Some(sel!(showPreferences:)),
-            ns_string!(""),
-        )
-    };
-    menu.addItem(&item);
+    let auto_switch = menu_item(mtm, ns_string!("英語と日本語を自動で切り替える"), sel!(toggleAutoSwitch:));
+    if crate::auto_switch_enabled(&app) {
+        auto_switch.setState(NSControlStateValueOn);
+    }
+    menu.addItem(&auto_switch);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&menu_item(mtm, ns_string!("Kayoiji の設定…"), sel!(showPreferences:)));
+    menu.addItem(&menu_item(mtm, ns_string!("About Kayoiji"), sel!(showAbout:)));
     Some(menu)
 }
 
-fn show_settings() {
-    let app = RUNTIME.with(|runtime| runtime.borrow().as_ref().map(|runtime| runtime.app.clone()));
-    let Some(app) = app else {
+fn menu_item(mtm: MainThreadMarker, title: &NSString, action: Sel) -> Retained<NSMenuItem> {
+    // SAFETY: `action` は、どれも `InputController` に定義したメソッドのセレクター。
+    unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), title, Some(action), ns_string!("")) }
+}
+
+fn show_window(show: fn(&AppHandle) -> tauri::Result<()>) {
+    let Some(app) = app_handle() else {
         return;
     };
-    if let Err(error) = crate::show_settings_window(&app) {
-        eprintln!("kayoiji: settings window: {error}");
+    if let Err(error) = show(&app) {
+        eprintln!("kayoiji: window: {error}");
     }
+}
+
+/// 設定をエンジンに反映する。入力モードが変わる時は、入力中の文字列を入力先に確定する。
+/// メインスレッドで呼ぶ。
+pub fn set_config(engine: &Mutex<Engine>, config: EngineConfig) {
+    let (output, view) = {
+        let mut engine = engine.lock().expect("engine lock");
+        let output = engine.set_config(config);
+        (output, engine.view())
+    };
+    let client = RUNTIME.with(|runtime| runtime.borrow().as_ref().and_then(|runtime| runtime.client.clone()));
+    let Some(client) = client else {
+        return;
+    };
+    apply(&client, output);
+    refresh_overlay(&client, view);
 }
 
 /// 入力メソッドのサーバーを起動する。入力メソッドのバンドルとして起動されていなければ `false` を返す。
@@ -242,7 +283,7 @@ fn handle_key(event: &NSEvent, client: &AnyObject) -> bool {
     if let Some(mode) = new_mode {
         // キーで切り替えた入力モードを OS に伝える。メニューバーのアイコンが変わる。
         let identifier = NSString::from_str(match mode {
-            InputMode::Auto => AUTO_MODE_ID,
+            InputMode::Japanese | InputMode::Auto => JAPANESE_MODE_ID,
             InputMode::Direct => DIRECT_MODE_ID,
         });
         // SAFETY: `selectInputMode:` は IMKTextInput のメソッド。
@@ -419,15 +460,16 @@ fn mode_selected(value: Option<&AnyObject>, client: Option<&AnyObject>) {
     let Some(identifier) = value.and_then(|value| value.downcast_ref::<NSString>()) else {
         return;
     };
-    let mode = if identifier.to_string() == DIRECT_MODE_ID {
-        InputMode::Direct
-    } else {
-        InputMode::Auto
-    };
+    let direct = identifier.to_string() == DIRECT_MODE_ID;
     let switched = RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
         let runtime = runtime.as_mut()?;
         let mut engine = runtime.engine.lock().expect("engine lock");
+        let mode = if direct {
+            InputMode::Direct
+        } else {
+            engine.kana_key_mode()
+        };
         // 同じモードの通知 (キーで切り替えた時に OS へ伝えた分の折り返しなど) は、切り替えとして扱わない。
         if engine.input_mode() == mode {
             return None;

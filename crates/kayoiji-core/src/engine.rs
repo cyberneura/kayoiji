@@ -13,8 +13,9 @@
 //! 日本語を確定した後は「日本語の入力が続いている」とみなし、次の単語も最初からかなで表示する
 //! (仮の日本語入力)。その単語がローマ字として読めないか、英単語だと分かった時点で英字に戻す。
 //!
-//! これらは自動切り替え (`InputMode::Auto`) の時の動作。直接入力 (`InputMode::Direct`) の間は、
-//! すべての打鍵をそのまま入力先へ通す。
+//! `Direct` での判定と仮の日本語入力は、自動切り替え (`InputMode::Auto`) の時の動作。
+//! 日本語入力 (`InputMode::Japanese`) では判定をせず、文字のキーはすべて `Composing` から始める。
+//! 直接入力 (`InputMode::Direct`) の間は、すべての打鍵をそのまま入力先へ通す。
 
 use std::io;
 
@@ -40,6 +41,9 @@ pub struct EngineConfig {
     /// 日本語の入力が続いている間に英単語をこの数だけ続けて入力したら、英語の入力に戻ったとみなす。
     /// 1 語で戻すと、文中に英単語を 1 つ挟んだだけで後続の助詞を日本語にできなくなる。
     pub english_words_to_leave_japanese: u32,
+    /// 「かな」キーで入る入力モードを、自動切り替え (`InputMode::Auto`) にする。
+    /// false なら日本語入力 (`InputMode::Japanese`)。
+    pub auto_switch: bool,
     pub detector: DetectorConfig,
 }
 
@@ -49,6 +53,7 @@ impl Default for EngineConfig {
             sequence_timeout_ms: 200,
             candidates_per_page: 9,
             english_words_to_leave_japanese: 2,
+            auto_switch: false,
             detector: DetectorConfig::default(),
         }
     }
@@ -57,6 +62,14 @@ impl Default for EngineConfig {
 impl EngineConfig {
     fn is_timed_out(&self, last_key_ms: Option<u64>, time_ms: u64) -> bool {
         last_key_ms.is_some_and(|last| time_ms.saturating_sub(last) > self.sequence_timeout_ms)
+    }
+
+    fn kana_key_mode(&self) -> InputMode {
+        if self.auto_switch {
+            InputMode::Auto
+        } else {
+            InputMode::Japanese
+        }
     }
 }
 
@@ -77,8 +90,9 @@ pub enum Key {
     ShiftLeft,
     /// Shift + 右矢印。変換中の文節を伸ばす。
     ShiftRight,
-    /// 変換キー (JIS 配列の「かな」)。直接入力なら自動切り替えにする。自動切り替えの時は、
-    /// かなを変換する。入力中でなければ、次の入力を日本語として始める。
+    /// 変換キー (JIS 配列の「かな」)。直接入力なら、日本語入力か自動切り替えにする
+    /// (`EngineConfig::auto_switch`)。日本語入力の時は何もしない。自動切り替えの時は、かなを変換する。
+    /// 入力中でなければ、次の入力を日本語として始める。
     Henkan,
     /// 無変換キー (JIS 配列の「英数」)。直接入力にする。
     Muhenkan,
@@ -148,6 +162,8 @@ impl Step {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InputMode {
+    /// すべての打鍵を日本語として入力する。
+    Japanese,
     /// 英語か日本語かを判定しながら入力する。
     Auto,
     /// すべての打鍵をそのまま入力先へ通す。
@@ -346,19 +362,25 @@ impl Engine {
         Self {
             detector,
             learning,
-            config,
             state: State::Direct(Direct::at_boundary()),
             japanese_flow: false,
             english_streak: 0,
-            input_mode: InputMode::Auto,
+            input_mode: config.kana_key_mode(),
             force_next: false,
             last_error: None,
+            config,
         }
     }
 
-    pub fn set_config(&mut self, config: EngineConfig) {
+    /// 設定を差し替える。「かな」キーで入る入力モードが変わり、今がその側のモードなら、
+    /// 新しいモードへ切り替える。戻り値は、切り替えに伴って入力先に対して行うこと。
+    pub fn set_config(&mut self, config: EngineConfig) -> Output {
         self.detector.set_config(config.detector.clone());
         self.config = config;
+        if self.input_mode == InputMode::Direct {
+            return self.output(Step::consume());
+        }
+        self.set_input_mode(self.config.kana_key_mode())
     }
 
     pub fn detector(&self) -> &Detector {
@@ -382,6 +404,11 @@ impl Engine {
         self.input_mode
     }
 
+    /// 「かな」キーで入る入力モード。
+    pub fn kana_key_mode(&self) -> InputMode {
+        self.config.kana_key_mode()
+    }
+
     /// `Key::ForceJapanese` を渡すと入力先から消すことになる、確定済みの文字列 (`Output::reread`)。
     ///
     /// 読み直しは単語を日本語として覚えるので、入力先は打鍵を渡す前にこの文字列がキャレットの
@@ -393,20 +420,26 @@ impl Engine {
         }
     }
 
-    /// 入力モードを切り替える。直接入力にする時は、入力中の文字列を打鍵したままの英字で確定する。
+    /// 入力モードを切り替える。入力中の文字列は確定する。
     pub fn set_input_mode(&mut self, mode: InputMode) -> Output {
         let mut step = Step::consume();
-        if mode == InputMode::Direct && self.input_mode == InputMode::Auto {
-            step.commit = match &self.state {
-                State::Direct(direct) if direct.pending => direct.word.clone(),
-                State::Direct(_) => String::new(),
-                State::Composing { raw, .. } => raw.clone(),
-                State::Converting(converting) => converting.raw.clone(),
-            };
-            self.reset();
+        if mode == self.input_mode {
+            return self.output(step);
         }
+        step.commit = match &self.state {
+            // 自動切り替えから直接入力にするのは、日本語と判定されたのを取り消す操作でもある。
+            // 打鍵したままの英字で確定する。
+            State::Composing { raw, .. } if self.leaves_auto_for_direct(mode) => raw.clone(),
+            State::Converting(converting) if self.leaves_auto_for_direct(mode) => converting.raw.clone(),
+            _ => self.preedit(),
+        };
+        self.reset();
         self.input_mode = mode;
         self.output(step)
+    }
+
+    fn leaves_auto_for_direct(&self, mode: InputMode) -> bool {
+        self.input_mode == InputMode::Auto && mode == InputMode::Direct
     }
 
     /// 未確定文字列を、表示されているとおりに確定する。入力先が切り替わる時に呼ぶ。
@@ -511,13 +544,18 @@ impl Engine {
             if key != Key::Henkan {
                 return Output::default();
             }
-            return self.set_input_mode(InputMode::Auto);
+            return self.set_input_mode(self.config.kana_key_mode());
         }
         if key == Key::Muhenkan {
             return self.set_input_mode(InputMode::Direct);
         }
+        if self.input_mode == InputMode::Japanese && key == Key::Henkan {
+            // すでに日本語入力なので、何も変えない。
+            return self.output(Step::consume());
+        }
         let state = std::mem::replace(&mut self.state, State::Direct(Direct::at_boundary()));
         let step = match state {
+            State::Direct(_) if self.input_mode == InputMode::Japanese => self.japanese_idle_key(key),
             State::Direct(direct) => self.handle_direct(direct, key, time_ms),
             State::Composing { raw, tentative } => self.handle_composing(raw, tentative, key, time_ms),
             State::Converting(converting) => self.handle_converting(converting, key, time_ms),
@@ -553,6 +591,19 @@ impl Engine {
         if self.english_streak >= self.config.english_words_to_leave_japanese {
             self.japanese_flow = false;
         }
+    }
+
+    /// 日本語入力で、入力中の文字列が無い時の打鍵。文字のキーは、記号も含めて日本語の入力を始める。
+    /// それ以外のキーは入力先のもの。
+    fn japanese_idle_key(&mut self, key: Key) -> Step {
+        let Key::Char(c) = key else {
+            return Step::pass();
+        };
+        self.state = State::Composing {
+            raw: c.to_string(),
+            tentative: false,
+        };
+        Step::consume()
     }
 
     fn handle_direct(&mut self, mut direct: Direct, key: Key, time_ms: u64) -> Step {
@@ -751,6 +802,12 @@ impl Engine {
         }
     }
 
+    /// 英字に戻す操作を、単語の言語の訂正として覚えるかどうか。日本語入力では、利用者は言語を
+    /// 自分で選んでいる。判定を直しているのではないので、覚えない。
+    fn learns_language(&self) -> bool {
+        self.input_mode == InputMode::Auto
+    }
+
     fn word_is_japanese(&self, direct: &Direct) -> bool {
         direct.pending && self.detector.evaluate_word(&direct.word, self.context()) == Verdict::Japanese
     }
@@ -832,7 +889,12 @@ impl Engine {
                 };
                 Step::consume()
             }
-            Key::Escape | Key::ForceEnglish => self.revert_to_english(raw, Some(tentative), time_ms),
+            // 日本語入力での Esc は、入力の取り消し。
+            Key::Escape if self.input_mode == InputMode::Japanese => Step::consume(),
+            Key::Escape | Key::ForceEnglish => {
+                let learn_in_flow = self.learns_language().then_some(tentative);
+                self.revert_to_english(raw, learn_in_flow, time_ms)
+            }
             Key::ForceJapanese => {
                 self.state = State::Composing { raw, tentative: false };
                 Step::consume()
@@ -883,6 +945,9 @@ impl Engine {
         else {
             unreachable!("the engine returns to Direct after a commit");
         };
+        if self.input_mode == InputMode::Japanese {
+            return self.japanese_idle_key(key);
+        }
         self.direct_key(direct, key, time_ms)
     }
 
@@ -1017,7 +1082,10 @@ impl Engine {
                 };
                 Step::consume()
             }
-            Key::ForceEnglish => self.revert_to_english(converting.raw, Some(converting.tentative), time_ms),
+            Key::ForceEnglish => {
+                let learn_in_flow = self.learns_language().then_some(converting.tentative);
+                self.revert_to_english(converting.raw, learn_in_flow, time_ms)
+            }
             Key::Katakana => {
                 select_katakana(converting.focused());
                 self.state = State::Converting(converting);
@@ -1162,10 +1230,17 @@ mod tests {
     use crate::simulate::Simulator;
 
     fn simulator() -> Simulator {
+        simulator_with(true)
+    }
+
+    fn simulator_with(auto_switch: bool) -> Simulator {
         Simulator::new(Engine::new(
             sample_detector(),
             Learning::in_memory(),
-            EngineConfig::default(),
+            EngineConfig {
+                auto_switch,
+                ..EngineConfig::default()
+            },
         ))
     }
 
@@ -2237,5 +2312,255 @@ mod tests {
         assert_eq!(simulator.engine.preedit(), "");
         assert_eq!(simulator.engine.view().mode, Mode::Direct);
         assert_eq!(simulator.engine.commit_composition(), "");
+    }
+
+    fn typed_in_japanese_mode(script: &str) -> String {
+        let mut simulator = simulator_with(false);
+        simulator.run(script);
+        simulator.text
+    }
+
+    #[test]
+    fn the_engine_starts_in_japanese_mode_unless_auto_switch_is_on() {
+        // Arrange / Act
+        let default = Engine::new(sample_detector(), Learning::in_memory(), EngineConfig::default());
+        let auto = simulator_with(true).engine;
+
+        // Assert
+        assert_eq!(default.input_mode(), InputMode::Japanese);
+        assert_eq!(auto.input_mode(), InputMode::Auto);
+    }
+
+    #[test]
+    fn japanese_mode_reads_an_english_word_as_kana() {
+        // 自動切り替えでは、「home」は英語と判定される。
+        assert_eq!(typed("home "), "home ");
+        assert_eq!(typed_in_japanese_mode("home{enter}"), "ほめ");
+    }
+
+    #[test]
+    fn japanese_mode_keeps_a_slowly_typed_word_as_kana() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.interval_ms = 1000;
+
+        // Act
+        simulator.run("kyou");
+
+        // Assert
+        assert_eq!(simulator.text, "きょう");
+        assert_eq!(simulator.committed, "");
+        assert_eq!(simulator.engine.timeout_deadline(), None);
+    }
+
+    #[test]
+    fn japanese_mode_converts_and_continues_with_the_next_word() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run("kyou ha");
+
+        // Assert
+        assert_eq!(simulator.committed, "今日");
+        assert_eq!(simulator.text, "今日は");
+        assert_eq!(simulator.engine.view().mode, Mode::Composing);
+    }
+
+    #[test]
+    fn japanese_mode_composes_symbols_and_digits() {
+        assert_eq!(typed_in_japanese_mode("kyou{enter}."), "きょう。");
+        assert_eq!(typed_in_japanese_mode("123"), "123");
+        assert_eq!(typed_in_japanese_mode("-"), "ー");
+    }
+
+    #[test]
+    fn japanese_mode_passes_keys_through_when_nothing_is_typed() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        let space = simulator.engine.handle(Key::Space, 0);
+        let enter = simulator.engine.handle(Key::Enter, 50);
+        let backspace = simulator.engine.handle(Key::Backspace, 100);
+        let reread = simulator.engine.handle(Key::ForceJapanese, 150);
+
+        // Assert
+        assert_eq!(space, Output::default());
+        assert_eq!(enter, Output::default());
+        assert_eq!(backspace, Output::default());
+        assert_eq!(reread, Output::default());
+        assert_eq!(simulator.engine.reread_target(), "");
+    }
+
+    #[test]
+    fn escape_in_japanese_mode_cancels_the_composition() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("kyou");
+
+        // Act
+        let output = simulator.engine.handle(Key::Escape, 1_000);
+
+        // Assert
+        assert_eq!(
+            output,
+            Output {
+                consumed: true,
+                ..Output::default()
+            }
+        );
+        assert_eq!(simulator.engine.view().mode, Mode::Direct);
+    }
+
+    #[test]
+    fn escape_while_converting_in_japanese_mode_returns_to_kana() {
+        assert_eq!(typed_in_japanese_mode("kyou {esc}"), "きょう");
+    }
+
+    #[test]
+    fn restoring_letters_in_japanese_mode_is_not_remembered() {
+        // Arrange: 自動切り替えでは、英字に戻すとその単語を英語として覚える
+        let mut auto = simulator();
+        auto.run("kyou{en} kyou");
+        assert_eq!(auto.text, "kyou kyou");
+        let mut simulator = simulator_with(false);
+
+        // Act: 日本語入力で英字に戻してから、自動切り替えにする
+        simulator.run("kyou{en}");
+        assert_eq!(simulator.text, "kyou");
+        simulator.clear();
+        simulator.engine.set_config(EngineConfig {
+            auto_switch: true,
+            ..EngineConfig::default()
+        });
+        simulator.run("kyou");
+
+        // Assert
+        assert_eq!(simulator.text, "きょう");
+    }
+
+    #[test]
+    fn henkan_in_japanese_mode_changes_nothing() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act / Assert
+        simulator.run("{henkan}");
+        assert!(!simulator.engine.view().forced);
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+
+        simulator.run("kyou{henkan}");
+        assert_eq!(simulator.text, "きょう");
+        assert_eq!(simulator.engine.view().mode, Mode::Composing);
+
+        simulator.run(" {henkan}");
+        assert_eq!(simulator.text, "今日");
+        assert_eq!(simulator.engine.view().mode, Mode::Converting);
+    }
+
+    #[test]
+    fn muhenkan_in_japanese_mode_commits_what_is_shown() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run("kyou{muhenkan}kyou ");
+
+        // Assert
+        assert_eq!(simulator.text, "きょうkyou ");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn henkan_returns_from_direct_input_to_japanese_mode() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{muhenkan}home ");
+
+        // Act
+        simulator.run("{henkan}home");
+
+        // Assert
+        assert_eq!(simulator.text, "home ほめ");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    #[test]
+    fn turning_auto_switch_on_commits_the_composition_and_changes_the_mode() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("kyou");
+
+        // Act
+        let output = simulator.engine.set_config(EngineConfig {
+            auto_switch: true,
+            ..EngineConfig::default()
+        });
+
+        // Assert
+        assert_eq!(
+            output,
+            Output {
+                consumed: true,
+                commit: "きょう".to_string(),
+                ..Output::default()
+            }
+        );
+        assert_eq!(simulator.engine.input_mode(), InputMode::Auto);
+    }
+
+    #[test]
+    fn turning_auto_switch_off_commits_the_undetermined_word() {
+        // Arrange
+        let mut simulator = simulator();
+        simulator.run("me");
+        assert_eq!(simulator.committed, "");
+
+        // Act
+        let output = simulator.engine.set_config(EngineConfig::default());
+
+        // Assert
+        assert_eq!(output.commit, "me");
+        assert_eq!(output.preedit, "");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+        assert_eq!(simulator.engine.timeout_deadline(), None);
+    }
+
+    #[test]
+    fn changing_the_config_in_direct_input_only_changes_where_henkan_goes() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{muhenkan}");
+
+        // Act
+        let output = simulator.engine.set_config(EngineConfig {
+            auto_switch: true,
+            ..EngineConfig::default()
+        });
+        let mode_after_config = simulator.engine.input_mode();
+        simulator.run("{henkan}");
+
+        // Assert
+        assert_eq!(output.commit, "");
+        assert_eq!(mode_after_config, InputMode::Direct);
+        assert_eq!(simulator.engine.input_mode(), InputMode::Auto);
+    }
+
+    #[test]
+    fn a_config_change_that_keeps_the_mode_keeps_the_composition() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("kyou");
+
+        // Act
+        let output = simulator.engine.set_config(EngineConfig {
+            sequence_timeout_ms: 500,
+            ..EngineConfig::default()
+        });
+
+        // Assert
+        assert_eq!(output.commit, "");
+        assert_eq!(output.preedit, "きょう");
     }
 }

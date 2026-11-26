@@ -14,12 +14,15 @@ const SEQUENCE_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 50..=2000;
 #[serde(default)]
 pub struct Settings {
     pub sequence_timeout_ms: u64,
+    /// 英語か日本語かを判定しながら入力する。false なら、「かな」「英数」キーで切り替える。
+    pub auto_switch: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             sequence_timeout_ms: EngineConfig::default().sequence_timeout_ms,
+            auto_switch: false,
         }
     }
 }
@@ -64,6 +67,7 @@ impl Settings {
     pub fn engine_config(&self) -> EngineConfig {
         EngineConfig {
             sequence_timeout_ms: self.sequence_timeout_ms,
+            auto_switch: self.auto_switch,
             ..EngineConfig::default()
         }
     }
@@ -89,6 +93,7 @@ mod tests {
             .join("settings.toml");
         let settings = Settings {
             sequence_timeout_ms: 350,
+            auto_switch: true,
         };
 
         // Act
@@ -98,6 +103,7 @@ mod tests {
         // Assert
         assert_eq!(loaded, settings);
         assert_eq!(loaded.engine_config().sequence_timeout_ms, 350);
+        assert!(loaded.engine_config().auto_switch);
     }
 
     #[test]
@@ -120,15 +126,25 @@ mod tests {
     fn empty_file_keeps_the_defaults() {
         let settings: Settings = toml::from_str("").expect("valid");
         assert_eq!(settings.sequence_timeout_ms, 200);
+        assert!(!settings.auto_switch);
+    }
+
+    #[test]
+    fn a_file_written_before_auto_switch_existed_turns_it_off() {
+        let settings: Settings = toml::from_str("sequence_timeout_ms = 350\n").expect("valid");
+        assert_eq!(settings.sequence_timeout_ms, 350);
+        assert!(!settings.engine_config().auto_switch);
     }
 
     #[test]
     fn timeout_outside_the_range_is_rejected() {
         let too_short = Settings {
             sequence_timeout_ms: 10,
+            ..Settings::default()
         };
         let too_long = Settings {
             sequence_timeout_ms: 5000,
+            ..Settings::default()
         };
         assert!(too_short.validate().is_err());
         assert!(too_long.validate().is_err());

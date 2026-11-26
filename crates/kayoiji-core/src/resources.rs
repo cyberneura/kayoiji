@@ -85,6 +85,14 @@ mod tests {
         directory
     }
 
+    /// 判断データベースが効いていることは、自動切り替えでなければ確かめられない。
+    fn auto_switch() -> EngineConfig {
+        EngineConfig {
+            auto_switch: true,
+            ..EngineConfig::default()
+        }
+    }
+
     fn typed_kore(engine: &mut Engine) -> String {
         for (index, c) in "kore".chars().enumerate() {
             engine.handle(Key::Char(c), index as u64 * 50);
@@ -98,8 +106,7 @@ mod tests {
         let directory = data_dir("open");
 
         // Act
-        let mut engine = open_engine(&directory, RuleSet::standard(), Learning::in_memory(), EngineConfig::default())
-            .expect("engine opens");
+        let mut engine = open_engine(&directory, RuleSet::standard(), Learning::in_memory(), auto_switch()).expect("engine opens");
 
         // Assert
         assert_eq!(typed_kore(&mut engine), "これ");
@@ -117,7 +124,7 @@ mod tests {
         // Act
         let (rules, error) = load_rules(&rules);
         let mut engine =
-            open_engine(&directory, rules, Learning::in_memory(), EngineConfig::default()).expect("engine opens");
+            open_engine(&directory, rules, Learning::in_memory(), auto_switch()).expect("engine opens");
 
         // Assert
         assert!(error.is_none());
@@ -142,7 +149,7 @@ mod tests {
         // Act
         let (rules, error) = load_rules(&rules);
         let mut engine =
-            open_engine(&directory, rules, Learning::in_memory(), EngineConfig::default()).expect("engine opens");
+            open_engine(&directory, rules, Learning::in_memory(), auto_switch()).expect("engine opens");
 
         // Assert
         assert!(error.expect("reported").to_string().contains("rules.toml"));

@@ -1,7 +1,10 @@
 export type Mode = 'direct' | 'composing' | 'converting';
 
-/** `auto` は英語か日本語かを判定しながら入力する。`direct` はすべての打鍵をそのまま通す。 */
-export type InputMode = 'auto' | 'direct';
+/**
+ * `japanese` はすべての打鍵を日本語として入力する。`auto` は英語か日本語かを判定しながら入力する。
+ * `direct` はすべての打鍵をそのまま通す。
+ */
+export type InputMode = 'japanese' | 'auto' | 'direct';
 
 /** 候補ウインドウに表示する内容。Rust 側の `kayoiji_core::engine::View` と同じ形。 */
 export interface View {
@@ -18,6 +21,8 @@ export interface View {
 
 export interface Settings {
   sequence_timeout_ms: number;
+  /** 英語か日本語かを判定しながら入力する。false なら、「かな」「英数」キーで切り替える。 */
+  auto_switch: boolean;
 }
 
 export interface AppStatus {
@@ -25,6 +30,8 @@ export interface AppStatus {
   /** OS の入力メソッドとして動いているかどうか。 */
   input_method_running: boolean;
   version: string;
+  /** ビルドした時刻 (UNIX 時間の秒)。 */
+  built_at: number;
   rules_path: string;
   /** 起動時に読めなかった利用者のファイルと、その理由。 */
   warnings: string[];

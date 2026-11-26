@@ -122,6 +122,18 @@ fn pad_timeout(state: State<'_, PadState>) -> PadResponse {
     response(&engine, output, now)
 }
 
+/// 自動切り替えを有効にする、または無効にする。入力中の文字列は確定する。
+#[tauri::command]
+fn pad_set_auto_switch(state: State<'_, PadState>, enabled: bool) -> PadResponse {
+    let now = state.now();
+    let mut engine = state.engine.lock().expect("engine lock");
+    let output = engine.set_config(EngineConfig {
+        auto_switch: enabled,
+        ..EngineConfig::default()
+    });
+    response(&engine, output, now)
+}
+
 /// 未確定文字列を、表示されているとおりに確定したことにする。カーソルを動かした時に呼ぶ。
 /// `reason` は、画面側で確定のきっかけになった操作。意図しない確定の原因を調べるために記録する。
 #[tauri::command]
@@ -168,6 +180,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pad_key,
             pad_timeout,
+            pad_set_auto_switch,
             pad_reset,
             pad_system_input_method
         ])

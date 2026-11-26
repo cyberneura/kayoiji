@@ -12,6 +12,9 @@ for file in kayoiji.dict english.fst symbols.dict; do
   fi
 done
 
+# 英文チェックの補助プロセス。ソースより古いまま同梱しないように、毎回ビルドする。
+pnpm helper
+
 pnpm tauri build --bundles app
 
 app="target/release/bundle/macos/Kayoiji.app"
@@ -64,7 +67,7 @@ if ! { mv "$staging" "$destination" && "$tool" register "$destination"; }; then
   exit 1
 fi
 
-# 入力ソースとして追加済みだった時は、増えた入力モードも有効にする。
+# 入力ソースとして追加済みだった時に、入れ替えで入力モードがどれも有効でなくなっていたら、先頭の入力モードを有効にする。
 enable_status=0
 if [[ -n "$was_enabled" ]]; then
   "$tool" enable "$destination" || enable_status=$?

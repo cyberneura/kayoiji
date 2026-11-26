@@ -1,14 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/kayoiji-core", "crates/kayoiji-cli", "src-tauri", "pad/src-tauri"]
+members = ["crates/kayoiji-core", "crates/kayoiji-check", "crates/kayoiji-cli", "src-tauri", "pad/src-tauri"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 publish = false
 
 [workspace.dependencies]
 kayoiji-core = { path = "crates/kayoiji-core" }
+kayoiji-check = { path = "crates/kayoiji-check" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

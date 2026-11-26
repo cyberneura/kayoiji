@@ -17,15 +17,25 @@
     ['英数 / 無変換', '直接入力にする (文字のキーをそのまま入力する)']
   ];
   const japaneseKeys = [
-    ['かな / 変換', '日本語入力にする'],
+    ['かな / 変換', '日本語入力にする。何も入力していない時に続けて 2 度押すと、英文チェックにする'],
     ['Esc', 'かなの入力中: 入力を取り消す。変換中: かなに戻る'],
     ['Ctrl + ; / F10', 'かなの入力中でも変換中でも、打ったままの英字に戻す']
   ];
   const autoKeys = [
-    ['かな / 変換', '自動切り替えにする。かなの入力中は変換する。入力中でなければ、次の入力を日本語として始める'],
+    [
+      'かな / 変換',
+      '自動切り替えにする。かなの入力中は変換する。入力中でなければ、次の入力を日本語として始める。何も入力していない時に続けて 2 度押すと、英文チェックにする'
+    ],
     ['Esc', 'かなの入力中: 打ったままの英字に戻す (その単語を英語として覚える)。変換中: かなに戻る'],
     ['Ctrl + ; / F10', 'かなの入力中でも変換中でも、打ったままの英字に戻す (その単語を英語として覚える)'],
     ['Ctrl + J', '直前の単語を日本語として読み直す (その単語を日本語として覚える)']
+  ];
+  const englishKeys = [
+    ['Enter', '英文を表示のとおりに確定する。英文チェックは続く'],
+    ['Tab', '英文を訂正案に置き換える'],
+    ['Esc', '英文を捨てる。何も打っていない時は、英文チェックをやめて直接入力にする'],
+    ['英数', '英文を確定して、直接入力にする'],
+    ['かな', '英文を確定して、日本語入力 (自動切り替えが有効なら自動切り替え) にする']
   ];
   const keys = $derived([...commonKeys, ...(status?.settings.auto_switch ? autoKeys : japaneseKeys)]);
 
@@ -106,6 +116,22 @@
         </span>
       </label>
 
+      <label class="flex items-start gap-2 {status.settings.auto_switch ? 'opacity-50' : ''}">
+        <input
+          data-annotate="input-leave-japanese-for-english"
+          type="checkbox"
+          class="mt-0.5"
+          bind:checked={status.settings.leave_japanese_for_english}
+          onchange={save}
+        />
+        <span class="flex flex-col gap-1">
+          <span>英語を打ち始めたら、日本語入力を自動で抜ける</span>
+          <span class="text-xs text-gray-500 dark:text-gray-400">
+            日本語入力で、大文字 (Shift + 英字)、ローマ字の規則に無い並び (st、pl など)、英語が続く記号 (/、@、# など) を打つか、何も入力していない時にスペースを打つと、入力中の文字列を確定して直接入力に切り替えます。、。「」ー〜 になる記号と ! ? では切り替えません。「かな」キーで日本語入力に戻ります。自動切り替えでは使いません。
+          </span>
+        </span>
+      </label>
+
       <label class="flex flex-col gap-1 {status.settings.auto_switch ? '' : 'opacity-50'}">
         <span>ひと続きの入力とみなす打鍵の間隔 (ミリ秒)</span>
         <div class="flex items-center gap-3">
@@ -134,6 +160,17 @@
       <h2 class="font-medium">キー操作</h2>
       <dl class="flex flex-col gap-1">
         {#each keys as [key, description]}
+          <div class="flex gap-3">
+            <dt class="w-44 shrink-0 font-mono text-xs leading-5 text-gray-600 dark:text-gray-300">
+              {key}
+            </dt>
+            <dd>{description}</dd>
+          </div>
+        {/each}
+      </dl>
+      <h3 class="mt-2 text-sm font-medium">英文チェック</h3>
+      <dl class="flex flex-col gap-1">
+        {#each englishKeys as [key, description]}
           <div class="flex gap-3">
             <dt class="w-44 shrink-0 font-mono text-xs leading-5 text-gray-600 dark:text-gray-300">
               {key}

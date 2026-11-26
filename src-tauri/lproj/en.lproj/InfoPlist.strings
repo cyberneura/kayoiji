@@ -1,0 +1,3 @@
+/* 入力ソースの一覧に出る、入力モードの名前。キーは Info.plist の入力モードの ID。 */
+"com.cyberneura.inputmethod.Kayoiji.Japanese" = "Japanese (Kayoiji)";
+"com.cyberneura.inputmethod.Kayoiji.Auto" = "Auto (Kayoiji)";

@@ -70,6 +70,29 @@ impl Parsed {
         segments_are_core && (self.pending.is_empty() || table.core_prefixes.contains(&self.pending))
     }
 
+    /// ローマ字の規則に当てはまらない打鍵があるかどうか ("st"、"pl")。あれば、日本語の入力ではない。
+    ///
+    /// `is_strict` より狭い。"thi" (てぃ)、"dhi" (でぃ)、"zh" (←) のように、英語の綴りに多くても
+    /// 規則にある打鍵と、その途中 ("th") は、日本語の入力とみなす。
+    pub fn has_unreadable(&self) -> bool {
+        self.segments.iter().any(|segment| !segment.converted)
+    }
+
+    /// 先頭から、規則で変換できない英字の手前までの表示と、その後ろの打鍵を返す。
+    /// "kyouhast" なら ("きょうは", "st")、"3gatsust" なら ("3がつ", "st")。
+    /// 数字や記号は規則に無くても、打ったとおりに表示しているので、かなの側に含める。
+    pub fn split_at_unreadable(&self) -> (String, String) {
+        let readable = self
+            .segments
+            .iter()
+            .take_while(|segment| segment.converted || !segment.raw.starts_with(|c: char| c.is_ascii_alphabetic()))
+            .count();
+        let kana = self.segments[..readable].iter().map(|s| s.out.as_str()).collect();
+        let mut rest: String = self.segments[readable..].iter().map(|s| s.raw.as_str()).collect();
+        rest.push_str(&self.pending);
+        (kana, rest)
+    }
+
     /// 確定時と同じ方法で未確定の打鍵を解決する。単独の "n" は「ん」にし、
     /// それ以外は打鍵のまま残す。
     pub fn finalize(mut self) -> Vec<Segment> {

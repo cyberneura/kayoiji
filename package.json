@@ -1,6 +1,6 @@
 {
   "name": "kayoiji",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Modeless Japanese/English input method for macOS",
   "type": "module",
   "private": true,
@@ -12,6 +12,7 @@
     "tauri": "tauri",
     "data": "bash scripts/fetch-data.sh && cargo run --release -p kayoiji-cli -- build-data",
     "test": "vitest run",
+    "helper": "bash scripts/build-helper.sh",
     "pad": "cd pad && tauri dev",
     "pad:build": "cd pad && tauri build"
   },

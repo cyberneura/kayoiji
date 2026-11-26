@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
   import {
     adoptNativeEdit,
@@ -11,7 +12,7 @@
     type PadOutput,
     type PadText
   } from '$lib/pad';
-  import type { View } from '$lib/types';
+  import { suggestion, type Review, type Spelling, type View } from '$lib/types';
 
   interface PadResponse extends PadOutput {
     view: View;
@@ -44,20 +45,76 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /** 打鍵がこの時間 (ミリ秒) 止まったら、綴りの訂正候補を作り、言語モデルに訂正文と訳を頼む。 */
+  const CHECK_DELAY_MS = 500;
+  let spelling = $state<Spelling | null>(null);
+  let review = $state<Review | null>(null);
+  let reviewError = $state('');
+  // 最後に頼んだ依頼の番号。打鍵が進んだ後に届いた、前の英文への答えを捨てる。
+  let reviewId = 0;
+  let reviewTimer: ReturnType<typeof setTimeout> | undefined;
+  const correction = $derived(suggestion(spelling, review));
+
+  /** 英文チェックで受け取っている英文が変わったら、綴りを調べ直し、訂正文と訳を頼み直す。 */
+  function refreshCheck() {
+    clearTimeout(reviewTimer);
+    // 前の英文に対する結果は、ここで消す。残すと、新しい結果が届くまでの間に押した Tab が、
+    // 前の英文の訂正案で今の英文を置き換える。
+    spelling = null;
+    review = null;
+    reviewId += 1;
+    const text = view.mode === 'checking' ? view.reading : '';
+    if (!text.trim()) return;
+    const id = reviewId;
+    const check = async (lookup: boolean) => {
+      const result = await invoke<Spelling>('pad_spelling', { text, lookup });
+      if (id === reviewId) spelling = result;
+      return result;
+    };
+    // 打鍵のたびには、すでに調べた単語の訂正候補だけを付ける。新しい候補を作るのは時間がかかる。
+    check(false).catch((cause) => console.error(cause));
+    reviewTimer = setTimeout(async () => {
+      try {
+        await invoke('pad_review', { id, text });
+        // 訂正候補は 1 回に数語ずつ作られる。英文が変わったらやめる。
+        while (id === reviewId && (await check(true)).pending);
+        reviewError = '';
+      } catch (cause) {
+        if (id === reviewId) reviewError = String(cause);
+      }
+    }, CHECK_DELAY_MS);
+  }
+
+  /**
+   * 英文チェックで受け取っている英文を、訂正案に置き換える。訂正案は、先に押したキーの処理が
+   * 終わってから読む。押した時点の訂正案を使うと、その後に処理される打鍵を消してしまう。
+   */
+  function applyCorrection() {
+    enqueue(async () => {
+      const text = correction;
+      if (!text || view.mode !== 'checking') return;
+      receive(await invoke<PadResponse>('pad_replace_english', { text }), null);
+    });
+  }
+
   const modeLabel = $derived(
     systemInputMethod
       ? 'OS'
       : view.input_mode === 'direct'
         ? 'A'
-        : view.input_mode === 'japanese' || view.forced
+        : view.input_mode === 'english'
+          ? '英文'
+          : view.input_mode === 'japanese' || view.forced
           ? 'あ'
           : '自動'
   );
   const modeTitle = $derived(
     systemInputMethod
       ? 'OS の入力メソッドで入力しています。内蔵のエンジンを試す時は、入力ソースを英字にしてください。'
-      : view.input_mode === 'direct'
-        ? `直接入力。クリックか「かな」で${autoSwitch ? '自動切り替え' : '日本語入力'}に戻します。`
+      : view.input_mode === 'english'
+        ? '英文チェック。Enter で確定、Esc で取り消し。何も打っていない時の Esc か「英数」で直接入力にします。'
+        : view.input_mode === 'direct'
+        ? `直接入力。「かな」を続けて 2 度押すと英文チェック。クリックか「かな」で${autoSwitch ? '自動切り替え' : '日本語入力'}に戻します。`
         : view.input_mode === 'japanese'
           ? '日本語入力。クリックか「英数」で直接入力にします。'
           : view.forced
@@ -99,6 +156,7 @@
     view = response.view;
     render();
     scheduleTimeout(response.timeout_ms);
+    refreshCheck();
   }
 
   function scheduleTimeout(timeoutMs: number | null) {
@@ -126,12 +184,18 @@
       text = commitPreedit(text);
       focus = null;
       view = await invoke<View>('pad_reset', { reason });
+      refreshCheck();
     });
   }
 
   function onkeydown(event: KeyboardEvent) {
     // OS の入力メソッドが有効な間は、入力を OS に任せる。
     if (systemInputMethod || event.isComposing || event.key === 'Process') return;
+    if (event.key === 'Tab' && view.mode === 'checking' && correction) {
+      event.preventDefault();
+      applyCorrection();
+      return;
+    }
     const key = keyFromEvent(event, view.mode);
     if (!key) {
       // 修飾キーだけの打鍵では、入力を区切らない。
@@ -209,8 +273,19 @@
     release('page load');
     setAutoSwitch(savedAutoSwitch());
     window.addEventListener('focus', refreshInputSource);
+    const unlisten = [
+      listen<Review>('english-review', (event) => {
+        if (event.payload.id === reviewId) review = event.payload;
+      }),
+      listen('english-review-failed', () => {
+        if (!review) reviewError = '訂正文を作れませんでした';
+      })
+    ];
     textarea?.focus();
-    return () => window.removeEventListener('focus', refreshInputSource);
+    return () => {
+      window.removeEventListener('focus', refreshInputSource);
+      for (const stop of unlisten) stop.then((stop) => stop());
+    };
   });
 </script>
 
@@ -244,6 +319,45 @@
           {/each}
           <li class="text-xs text-gray-500 dark:text-gray-400">{view.page + 1}/{view.page_count}</li>
         </ol>
+      {:else if view.mode === 'checking' && view.reading.trim()}
+        <dl data-annotate="panel-english-check" class="flex flex-col gap-1 text-xs">
+          {#if spelling && spelling.misspellings.length > 0}
+            <div class="flex gap-2">
+              <dt class="w-10 shrink-0 text-gray-500 dark:text-gray-400">綴り</dt>
+              <dd class="flex flex-wrap gap-x-3 gap-y-1">
+                {#each spelling.misspellings as misspelling}
+                  <span>
+                    <span class="text-red-600 line-through dark:text-red-400">{misspelling.word}</span>
+                    {misspelling.guesses.length > 0 ? misspelling.guesses.join(' / ') : '候補なし'}
+                  </span>
+                {/each}
+              </dd>
+            </div>
+          {/if}
+          <div class="flex gap-2">
+            <dt class="w-10 shrink-0 text-gray-500 dark:text-gray-400">英文</dt>
+            <dd>
+              {#if reviewError}
+                <span class="text-gray-500 dark:text-gray-400">{reviewError}</span>
+              {:else if !review}
+                <span class="text-gray-500 dark:text-gray-400">…</span>
+              {:else if review.unchanged}
+                自然な英語です
+              {:else}
+                {review.corrected}
+              {/if}
+            </dd>
+          </div>
+          {#if review}
+            <div class="flex gap-2">
+              <dt class="w-10 shrink-0 text-gray-500 dark:text-gray-400">訳</dt>
+              <dd>{review.translation}</dd>
+            </div>
+          {/if}
+          {#if correction}
+            <p class="text-gray-500 dark:text-gray-400">Tab で訂正案に置き換える / Enter でこのまま確定</p>
+          {/if}
+        </dl>
       {:else}
         <p class="text-xs text-gray-500 dark:text-gray-400">{modeTitle}</p>
       {/if}

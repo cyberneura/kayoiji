@@ -87,39 +87,11 @@
 				<key>tsInputModePrimaryInScriptKey</key>
 				<false/>
 			</dict>
-			<key>com.cyberneura.inputmethod.Kayoiji.Roman</key>
-			<dict>
-				<key>TISInputSourceID</key>
-				<string>com.cyberneura.inputmethod.Kayoiji.Roman</string>
-				<key>TISIntendedLanguage</key>
-				<string>en</string>
-				<key>TISIconIsTemplate</key>
-				<true/>
-				<key>tsInputModeScriptKey</key>
-				<string>smRoman</string>
-				<key>tsInputModeCharacterRepertoireKey</key>
-				<array>
-					<string>Latn</string>
-				</array>
-				<key>tsInputModeMenuIconFileKey</key>
-				<string>menu-icon-roman.pdf</string>
-				<key>tsInputModeAlternateMenuIconFileKey</key>
-				<string>menu-icon-roman.pdf</string>
-				<key>tsInputModePaletteIconFileKey</key>
-				<string>menu-icon-roman.pdf</string>
-				<key>tsInputModeDefaultStateKey</key>
-				<true/>
-				<key>tsInputModeIsVisibleKey</key>
-				<true/>
-				<key>tsInputModePrimaryInScriptKey</key>
-				<true/>
-			</dict>
 		</dict>
 		<key>tsVisibleInputModeOrderedArrayKey</key>
 		<array>
 			<string>com.cyberneura.inputmethod.Kayoiji.Japanese</string>
 			<string>com.cyberneura.inputmethod.Kayoiji.Auto</string>
-			<string>com.cyberneura.inputmethod.Kayoiji.Roman</string>
 		</array>
 	</dict>
 </dict>

@@ -30,6 +30,11 @@ use crate::rules::Language;
 
 /// 訂正として覚える英単語の長さの上限。長い文を取り消した時に、文全体を単語として覚えない。
 const LEARNABLE_WORD_LEN: usize = 12;
+/// 区切り直した範囲を 1 語として覚える時の、読みの長さの上限 (文字数)。前の文節を区切り直すと後ろの
+/// 文節も変換し直されるので、文の大半が 1 つの範囲になることがある。それは語ではないので覚えない。
+const PHRASE_MAX_CHARS: usize = 12;
+/// 覚える語を作る、辞書の語の数の下限。辞書の 1 語を分けて選んだだけなら、辞書がすでに変換できる。
+const PHRASE_MIN_WORDS: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -306,6 +311,10 @@ struct Converting {
     segments: Vec<ConvertingSegment>,
     /// 候補を選んでいる文節。
     focus: usize,
+    /// 変換を始めた時の、文節の終わりの位置 (読みの先頭からの文字数)。
+    /// 利用者が区切り直した範囲を知るために覚えておく。カタカナにする変換は、文節に区切らずに
+    /// 始めるので空にする。そこから区切り直しても、変換器の区切りを直したことにはならない。
+    converted_ends: Vec<usize>,
 }
 
 impl Converting {
@@ -315,6 +324,41 @@ impl Converting {
 
     fn focused(&mut self) -> &mut ConvertingSegment {
         &mut self.segments[self.focus]
+    }
+
+    /// 利用者が区切り直した範囲を返す。範囲は、文節ごとの読みと表記の並びと、変換を始めた時の
+    /// 文節をまたいでまとめたかどうか。
+    ///
+    /// 変換を始めた時の区切りと今の区切りが一致する位置で全体を分け、その間の区切りが変わっている
+    /// 部分を 1 つの範囲にする。「かよいじ」を「かよい」「じ」に分けて確定したなら、「かよいじ」が範囲になる。
+    fn regrouped(&self) -> Vec<(Vec<(String, String)>, bool)> {
+        let mut groups = Vec::new();
+        let mut group_start = 0;
+        let mut begin = 0;
+        let mut end = 0;
+        for (index, segment) in self.segments.iter().enumerate() {
+            end += segment.reading.chars().count();
+            if !self.converted_ends.contains(&end) {
+                continue;
+            }
+            let group = &self.segments[group_start..=index];
+            let merged = self.converted_ends.iter().any(|&converted| begin < converted && converted < end);
+            if group.len() > 1 || merged {
+                groups.push((group, merged));
+            }
+            group_start = index + 1;
+            begin = end;
+        }
+        groups
+            .into_iter()
+            .map(|(group, merged)| {
+                let segments = group
+                    .iter()
+                    .map(|segment| (segment.reading.clone(), segment.surface().to_string()))
+                    .collect();
+                (segments, merged)
+            })
+            .collect()
     }
 
     /// 候補を選んでいる文節の、表示の中での範囲 (先頭からの文字数と長さ)。
@@ -358,6 +402,9 @@ impl Engine {
         detector.set_config(config.detector.clone());
         for (word, language, in_flow) in learning.languages() {
             detector.learn(word, language, in_flow);
+        }
+        for words in learning.phrases() {
+            detector.converter_mut().learn_phrase(words);
         }
         Self {
             detector,
@@ -973,11 +1020,23 @@ impl Engine {
             let converted = self.detector.converter().segments(&reading);
             converted.into_iter().map(|segment| self.learned(segment)).collect()
         };
+        let converted_ends = if katakana {
+            Vec::new()
+        } else {
+            segments
+                .iter()
+                .scan(0, |end, segment: &ConvertingSegment| {
+                    *end += segment.reading.chars().count();
+                    Some(*end)
+                })
+                .collect()
+        };
         self.state = State::Converting(Converting {
             raw,
             tentative,
             segments,
             focus: 0,
+            converted_ends,
         });
         Step::consume()
     }
@@ -1125,6 +1184,9 @@ impl Engine {
                 self.learn_conversion(&segment.reading, &candidate.surface);
             }
         }
+        for (segments, merged) in converting.regrouped() {
+            self.learn_phrase(&segments, merged);
+        }
         let text = converting.display();
         self.finish_japanese();
         Step::commit(text)
@@ -1144,8 +1206,94 @@ impl Engine {
     }
 
     fn learn_conversion(&mut self, reading: &str, surface: &str) {
+        // 区切り直して覚えた語と違う表記を選んだら、その語は忘れる。覚えたままにすると、
+        // 文の途中ではその語が出続ける。
+        if self.learning.phrase(reading).is_some_and(|known| known != surface) {
+            self.forget_phrase(reading);
+        }
         if let Err(error) = self.learning.record_conversion(reading, surface) {
             self.last_error = Some(error);
+        }
+    }
+
+    fn forget_phrase(&mut self, reading: &str) {
+        self.detector.converter_mut().forget_phrase(reading);
+        if let Err(error) = self.learning.forget_phrase(reading) {
+            self.last_error = Some(error);
+        }
+    }
+
+    /// 利用者が区切り直して確定した範囲 (文節ごとの読みと表記) を、1 語として覚える。
+    /// 同じ読みを次に変換した時に先頭に出し、助詞が続く時や文の途中でも、変換に使う。
+    ///
+    /// 覚えるのは、範囲から末尾の助詞や助動詞を除いた部分。「かよい」「じを」を「通い」「路を」で
+    /// 確定したら、「かよいじ」を「通い路」として覚える。助詞ごと覚えると、ほかの助詞が続く時に
+    /// 効かない上に、後ろに続く語とのつながりを誤る。
+    fn learn_phrase(&mut self, segments: &[(String, String)], merged: bool) {
+        let converter = self.detector.converter();
+        let mut words = Vec::new();
+        for (reading, surface) in segments {
+            // 辞書の語だけで作れない表記 (ひらがなのまま、カタカナ) を含む範囲は覚えない。
+            // 語の前後のつながりを辞書から決められない。
+            let Some(found) = converter.words(reading, surface) else {
+                return;
+            };
+            words.extend(found);
+        }
+        // 辞書の付属語には、助詞や助動詞のほかに接尾語 (「路」「時」) も入っている。かなのままの
+        // 付属語だけを助詞や助動詞とみなして除く。利用者が漢字で選んだ接尾語は、語の一部として残す。
+        while words.last().is_some_and(|word| word.function && word.reading == word.surface) {
+            words.pop();
+        }
+        let words: Vec<(String, String)> = words.into_iter().map(|word| (word.reading, word.surface)).collect();
+        let reading: String = words.iter().map(|(reading, _)| reading.as_str()).collect();
+        let surface: String = words.iter().map(|(_, surface)| surface.as_str()).collect();
+        if reading.chars().count() > PHRASE_MAX_CHARS {
+            return;
+        }
+        if words.len() < PHRASE_MIN_WORDS {
+            // 文節をまとめて辞書の 1 語を選んだ時は、変換器が 2 つに分けてしまう語として覚える。
+            // 覚えないと、次の変換でもまた分かれて、文節ごとに覚えた候補が当たらない。
+            let split_by_converter = merged
+                && words.len() == 1
+                && converter
+                    .convert(&reading, 1)
+                    .first()
+                    .is_none_or(|best| best.surface != surface);
+            if !split_by_converter {
+                return;
+            }
+        }
+        if let Some(dropped) = self.learning.phrase_to_drop(&reading).map(str::to_string) {
+            self.detector.converter_mut().forget_phrase(&dropped);
+        }
+        if !self.detector.converter_mut().learn_phrase(&words) {
+            return;
+        }
+        if let Err(error) = self.learning.record_phrase(&words) {
+            self.last_error = Some(error);
+        }
+        // 同じ読みの文節で以前に選んだ表記は忘れる。残すと、語より先に出る。
+        // ここで語の表記を文節の選択として記録することはしない。「ゆきが」を「雪賀」と覚えた時に
+        // 記録すると、「雪が積もる」の文節「ゆきが」まで「雪賀」になる。
+        if let Err(error) = self.learning.retain_conversions(&reading, |chosen| chosen == surface) {
+            self.last_error = Some(error);
+        }
+        // この語を含む読みで以前に選んだ表記が残っていると、助詞が付いた読みでは、語を覚える前の
+        // 選択が先頭に出続ける。変換にこの語が使われる読みに限って、語を使っていない選択を忘れる。
+        for known in self.learning.readings_containing(&reading) {
+            let uses_phrase = self
+                .detector
+                .converter()
+                .convert(&known, 1)
+                .first()
+                .is_some_and(|best| best.surface.contains(&surface));
+            if !uses_phrase {
+                continue;
+            }
+            if let Err(error) = self.learning.retain_conversions(&known, |chosen| chosen.contains(&surface)) {
+                self.last_error = Some(error);
+            }
         }
     }
 }
@@ -1719,6 +1867,299 @@ mod tests {
         // Assert
         assert_eq!(simulator.engine.view().reading, "きょうは");
         assert_eq!(simulator.text, "今日は晴れ");
+    }
+
+    fn words(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(reading, surface)| (reading.to_string(), surface.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_resegmented_span_is_offered_first_next_time() {
+        // Arrange: 「羽目」で確定したことがある「はめ」を、「は」「め」に区切り直して確定する
+        let mut simulator = simulator_with(false);
+        simulator.run("hame {enter}hame ");
+        assert_eq!(simulator.text, "羽目羽目");
+        simulator.run("{sleft}{enter}");
+        assert_eq!(simulator.text, "羽目歯目");
+
+        // Act
+        simulator.run("hame ");
+
+        // Assert
+        assert_eq!(simulator.text, "羽目歯目歯目");
+        // 区切り直した範囲が、1 つの文節になる。
+        assert_eq!(simulator.engine.view().reading, "はめ");
+    }
+
+    #[test]
+    fn a_learned_span_is_used_before_a_particle() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("hamega ");
+        assert_eq!(simulator.text, "羽目が");
+        simulator.run("{enter}hame {sleft}{enter}");
+
+        // Act
+        simulator.run("hamega ");
+
+        // Assert
+        // 語を覚える前に「羽目が」で確定したことより、覚えた語を優先する。
+        assert_eq!(simulator.text, "羽目が歯目歯目が");
+    }
+
+    #[test]
+    fn a_span_resegmented_with_its_particle_is_learned_without_the_particle() {
+        // Arrange: 「はめが」を「は」「めが」に区切り直して確定する
+        let mut simulator = simulator_with(false);
+        simulator.run("hamega {sleft}{sleft}");
+        assert_eq!(simulator.text, "歯目が");
+        simulator.run("{enter}");
+
+        // Act
+        simulator.run("hame {enter}hamewo ");
+
+        // Assert
+        assert_eq!(simulator.text, "歯目が歯目歯目を");
+        assert_eq!(simulator.engine.learning.phrase("はめが"), None);
+    }
+
+    #[test]
+    fn a_suffix_chosen_in_kanji_stays_in_the_learned_span() {
+        // Arrange: 「側」は辞書では付属語。「かねがわ」を「かね」「がわ」に区切り直して確定する
+        let mut simulator = simulator_with(false);
+        simulator.run("kanegawa ");
+        assert_eq!(simulator.engine.view().reading, "かねがわ");
+
+        // Act
+        simulator.run("{sleft}{sleft}{enter}");
+
+        // Assert
+        assert_eq!(simulator.text, "鐘側");
+        assert_eq!(simulator.engine.learning.phrase("かねがわ"), Some("鐘側"));
+    }
+
+    #[test]
+    fn splitting_a_particle_off_a_word_learns_nothing() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("kyouha ");
+
+        // Act: 「きょうは」を「きょう」「は」に分けて、「京」と助詞の「は」を選んで確定する
+        simulator.run("{sleft} {right} ");
+        assert_eq!(simulator.text, "京は");
+        simulator.run("{enter}");
+
+        // Assert
+        // 「京」は辞書の 1 語なので、語としては覚えない。覚えると、「きょう」を含む変換がどれも変わる。
+        assert_eq!(simulator.engine.learning.phrases().count(), 0);
+    }
+
+    #[test]
+    fn learned_spans_are_used_after_a_restart() {
+        // Arrange
+        let mut learning = Learning::in_memory();
+        learning.record_phrase(&words(&[("は", "歯"), ("め", "目")])).expect("recorded");
+        let config = EngineConfig::default();
+        let mut simulator = Simulator::new(Engine::new(sample_detector(), learning, config));
+
+        // Act
+        simulator.run("hamega ");
+
+        // Assert
+        assert_eq!(simulator.text, "歯目が");
+    }
+
+    #[test]
+    fn choosing_another_candidate_forgets_the_learned_span() {
+        // Arrange: 語を覚えた後に、助詞を付けて確定したことがある
+        let mut simulator = simulator_with(false);
+        simulator.run("hame {sleft}{enter}hamega {enter}hame ");
+        assert_eq!(simulator.text, "歯目歯目が歯目");
+
+        // Act: 同じ読みで「羽目」を選び直す
+        simulator.run(" ");
+        assert_eq!(simulator.text, "歯目歯目が羽目");
+        simulator.run("{enter}hamega ");
+
+        // Assert
+        assert_eq!(simulator.text, "歯目歯目が羽目羽目が");
+    }
+
+    #[test]
+    fn segments_merged_into_one_are_learned_as_a_span() {
+        // Arrange: 「これ」「あめ」を 1 つの文節に伸ばして、「これ飴」を選ぶ
+        let mut simulator = simulator_with(false);
+        simulator.run("koreame ");
+        assert_eq!(simulator.text, "これ雨");
+        assert_eq!(simulator.engine.view().reading, "これ");
+        simulator.run("{sright}{sright}");
+        assert_eq!(simulator.engine.view().reading, "これあめ");
+        simulator.run(" ");
+        assert_eq!(simulator.text, "これ飴");
+        simulator.run("{enter}");
+
+        // Act
+        simulator.run("koreame ");
+
+        // Assert
+        assert_eq!(simulator.text, "これ飴これ飴");
+        assert_eq!(simulator.engine.view().reading, "これあめ");
+    }
+
+    #[test]
+    fn a_span_read_like_a_word_and_a_particle_leaves_the_particle_alone() {
+        // Arrange: 「これは」を「これ」「は」に分けて、「歯」を選んで確定する
+        let mut simulator = simulator_with(false);
+        simulator.run("koreha {sleft}{enter}");
+        assert_eq!(simulator.text, "これ歯");
+        assert_eq!(simulator.engine.learning.phrase("これは"), Some("これ歯"));
+
+        // Act
+        simulator.run("korehaame ");
+
+        // Assert
+        // 文の中の「これは」は、助詞の「は」のまま。
+        assert_eq!(simulator.text, "これ歯これは雨");
+    }
+
+    #[test]
+    fn a_dictionary_word_chosen_by_merging_segments_is_learned() {
+        // Arrange: 「此雨」は辞書の 1 語だが、変換器は「これ」「あめ」に分ける
+        let mut simulator = simulator_with(false);
+        simulator.run("koreame {sright}{sright}");
+        for _ in 0..20 {
+            if simulator.text == "此雨" {
+                break;
+            }
+            simulator.run(" ");
+        }
+        assert_eq!(simulator.text, "此雨");
+        simulator.run("{enter}");
+
+        // Act
+        simulator.run("koreame ");
+
+        // Assert
+        assert_eq!(simulator.text, "此雨此雨");
+        assert_eq!(simulator.engine.view().reading, "これあめ");
+    }
+
+    #[test]
+    fn spans_are_learned_separately_around_an_untouched_segment() {
+        // Arrange: 「はめ」「これ」「はめ」の、最初と最後だけを区切り直す
+        let mut simulator = simulator_with(false);
+        simulator.run("hamekorehame ");
+        assert_eq!(simulator.text, "羽目これ羽目");
+
+        // Act
+        simulator.run("{sleft}{right}{right}{right}{sleft}{enter}");
+
+        // Assert
+        assert_eq!(simulator.text, "歯目これ歯目");
+        assert_eq!(simulator.engine.learning.phrases().count(), 1);
+        assert_eq!(simulator.engine.learning.phrase("はめ"), Some("歯目"));
+    }
+
+    #[test]
+    fn a_span_as_long_as_a_sentence_is_not_learned() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("watasinonamaehanihongonyuuryokudesu ");
+        let converted = simulator.text.clone();
+
+        // Act: 最初の文節を、文の終わりまで伸ばして確定する
+        for _ in 0..16 {
+            simulator.run("{sright}");
+        }
+        assert_eq!(simulator.engine.view().reading, "わたしのなまえはにほんごにゅうりょくです");
+        simulator.run("{enter}");
+
+        // Assert
+        assert_eq!(simulator.text, converted);
+        assert_eq!(simulator.engine.learning.phrases().count(), 0);
+    }
+
+    #[test]
+    fn a_span_with_a_date_is_not_learned() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("kyouha {sleft}");
+        let today = simulator
+            .engine
+            .view()
+            .candidates
+            .iter()
+            .position(|candidate| candidate.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .expect("a date is offered for きょう");
+
+        // Act
+        for _ in 0..today {
+            simulator.run(" ");
+        }
+        simulator.run("{enter}");
+
+        // Assert
+        // 日付は辞書の語ではないので、前後のつながりを決められない。
+        assert_eq!(simulator.engine.learning.phrases().count(), 0);
+    }
+
+    #[test]
+    fn resegmenting_after_a_katakana_conversion_learns_nothing() {
+        // Arrange: カタカナにする変換は、文節に区切らずに始まる
+        let mut simulator = simulator_with(false);
+        simulator.run("hamega{kata}");
+        assert_eq!(simulator.text, "ハメガ");
+
+        // Act
+        simulator.run("{sleft}{sleft}{enter}");
+
+        // Assert
+        assert_eq!(simulator.text, "歯目が");
+        assert_eq!(simulator.engine.learning.phrases().count(), 0);
+    }
+
+    #[test]
+    fn a_span_dropped_beyond_the_limit_is_no_longer_converted() {
+        // Arrange: 覚えた語が上限に達していて、いちばん古い語が「はめ」
+        let mut learning = Learning::in_memory();
+        learning.record_phrase(&words(&[("は", "歯"), ("め", "目")])).expect("recorded");
+        while learning.phrase_to_drop("これあめ").is_none() {
+            let reading = format!("よみ{}", learning.phrases().count());
+            learning.record_phrase(&words(&[(reading.as_str(), "語"), ("ご", "後")])).expect("recorded");
+        }
+        let config = EngineConfig::default();
+        let mut simulator = Simulator::new(Engine::new(sample_detector(), learning, config));
+        simulator.run("hame ");
+        assert_eq!(simulator.text, "歯目");
+        simulator.run("{enter}");
+
+        // Act: 新しい語を覚える
+        simulator.run("koreame {sright}{sright}{enter}");
+
+        // Assert
+        assert_eq!(simulator.engine.learning.phrase("はめ"), None);
+        simulator.run("hamega ");
+        assert!(simulator.text.ends_with("羽目が"), "{}", simulator.text);
+    }
+
+    #[test]
+    fn learning_a_span_keeps_choices_for_readings_it_does_not_change() {
+        // Arrange: 「あめ」「かね」を 1 つの文節にして「雨鐘」で確定してある
+        let mut simulator = simulator_with(false);
+        simulator.run("amekane {sright}{sright}{enter}");
+        assert_eq!(simulator.text, "雨鐘");
+        assert_eq!(simulator.engine.learning.conversions("あめかね"), ["雨鐘"]);
+
+        // Act: 「め」「かね」を 1 つの文節にして、「めかね」を「目鐘」として覚える
+        simulator.run("mekane {sright}{sright}{enter}");
+
+        // Assert
+        assert_eq!(simulator.engine.learning.phrase("めかね"), Some("目鐘"));
+        // 「あめかね」は読みに「めかね」を含むが、変換に「目鐘」は使われない。選んだ表記は残す。
+        assert_eq!(simulator.engine.learning.conversions("あめかね"), ["雨鐘"]);
     }
 
     #[test]

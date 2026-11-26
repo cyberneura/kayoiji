@@ -32,6 +32,17 @@ const LEADING_CONVERSIONS: usize = 3;
 /// 記号や日付の候補のうち、上位に置く数。残りは一覧の末尾に置く。
 const LEADING_SUPPLEMENTS: usize = 6;
 const WORD_CANDIDATES: usize = 60;
+/// 利用者が覚えさせた語 (`Converter::learn_phrase`) のコストの上限。辞書のよく使われる語と同じ程度。
+/// 語のコストは、同じ読みの辞書だけの変換に勝つ値にする (`PHRASE_MARGIN`)。その値が大きい時は、
+/// 文の途中でも語が使われるように、この上限まで下げる。
+///
+/// ただし、辞書だけの変換が「雪が」のようにかなの付属語で終わる読みでは、上限まで下げない。
+/// その読みは多くの文に現れるので、下げると「雪賀」を覚えた後の「雪が積もる」まで語に置き換わる。
+const PHRASE_COST: i32 = 3000;
+/// 覚えた語を、同じ読みの辞書だけの変換よりどれだけ優先するか。
+const PHRASE_MARGIN: i32 = 500;
+/// 表記から辞書の語の並びを求める時に調べる経路の数。
+const WORD_PATHS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -47,6 +58,23 @@ pub struct Segment {
     pub candidates: Vec<Candidate>,
 }
 
+/// 変換の経路を作っている、辞書の語。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Word {
+    pub reading: String,
+    pub surface: String,
+    /// 助詞や助動詞のように、前の語と同じ文節に入る語かどうか。
+    pub function: bool,
+}
+
+/// 利用者が覚えさせた語。左右の文脈 ID は、語を作っている最初と最後の辞書の語から取る。
+struct Phrase {
+    surface: String,
+    lid: u16,
+    rid: u16,
+    cost: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversion {
     pub surface: String,
@@ -58,6 +86,8 @@ enum Surface {
     Entry(u32),
     /// 読みの該当範囲をそのまま表記にする。
     Literal,
+    /// 利用者が覚えさせた語。表記は読みから引く。
+    Phrase,
 }
 
 struct Node {
@@ -73,6 +103,8 @@ struct Node {
 
 struct Lattice<'a> {
     dictionary: &'a Dictionary,
+    /// 利用者が覚えさせた語。変換に使わない時は `None`。
+    phrases: Option<&'a Phrases>,
     reading: &'a str,
     /// 各文字のバイト位置。末尾に読み全体の長さを持つ。
     offsets: Vec<usize>,
@@ -82,7 +114,12 @@ struct Lattice<'a> {
 
 impl<'a> Lattice<'a> {
     /// `mid_sentence` が true なら、読みが文頭だけでなく名詞の直後にも置かれうるものとして評価する。
-    fn build(dictionary: &'a Dictionary, reading: &'a str, mid_sentence: bool) -> Self {
+    fn build(
+        dictionary: &'a Dictionary,
+        phrases: Option<&'a Phrases>,
+        reading: &'a str,
+        mid_sentence: bool,
+    ) -> Self {
         let chars: Vec<char> = reading.chars().collect();
         let mut offsets: Vec<usize> = reading.char_indices().map(|(offset, _)| offset).collect();
         offsets.push(reading.len());
@@ -138,11 +175,33 @@ impl<'a> Lattice<'a> {
                 surface: Surface::Literal,
                 best: i32::MAX,
             });
+            if let Some(phrases) = phrases {
+                // 覚えた語の読みより長い範囲は引かない。語を覚えていなければ、何も調べない。
+                let limit = (position + phrases.longest).min(length);
+                let kana_end = (position..limit)
+                    .find(|&index| !is_kana(chars[index]))
+                    .unwrap_or(limit);
+                for end in position + 1..=kana_end {
+                    let Some(phrase) = phrases.words.get(&reading[start_offset..offsets[end]]) else {
+                        continue;
+                    };
+                    begins_at[position].push(Node {
+                        begin: position,
+                        end,
+                        lid: phrase.lid,
+                        rid: phrase.rid,
+                        cost: phrase.cost,
+                        surface: Surface::Phrase,
+                        best: i32::MAX,
+                    });
+                }
+            }
             position += 1;
         }
 
         let mut lattice = Self {
             dictionary,
+            phrases,
             reading,
             offsets,
             nodes: Vec::new(),
@@ -201,6 +260,10 @@ impl<'a> Lattice<'a> {
         match node.surface {
             Surface::Entry(index) => self.dictionary.entry(index).surface,
             Surface::Literal => self.node_reading(node),
+            Surface::Phrase => {
+                let phrases = self.phrases.expect("a phrase node exists only with phrases");
+                &phrases.words[self.node_reading(node)].surface
+            }
         }
     }
 
@@ -210,6 +273,7 @@ impl<'a> Lattice<'a> {
             Surface::Entry(_) => self.dictionary.is_function(node.lid),
             // 記号や英数字は、前の文節に付ける。辞書に無いかなは、独立した文節にする。
             Surface::Literal => !self.node_reading(node).chars().all(is_kana),
+            Surface::Phrase => false,
         }
     }
 
@@ -306,10 +370,20 @@ impl<'a> Lattice<'a> {
     }
 }
 
+/// 利用者が覚えさせた語。読みから引く。
+#[derive(Default)]
+struct Phrases {
+    words: HashMap<String, Phrase>,
+    /// 覚えた語の読みの長さの上限 (文字数)。ラティスの各位置で、この長さまでの読みを引く。
+    /// 語を忘れても縮めない。
+    longest: usize,
+}
+
 pub struct Converter {
     dictionary: Arc<Dictionary>,
     /// 読みから記号や顔文字を引く辞書。
     symbols: Option<Arc<Dictionary>>,
+    phrases: Phrases,
     today: Box<dyn Fn() -> NaiveDate + Send + Sync>,
 }
 
@@ -318,8 +392,98 @@ impl Converter {
         Self {
             dictionary,
             symbols: None,
+            phrases: Phrases::default(),
             today: Box::new(|| Local::now().date_naive()),
         }
+    }
+
+    /// 辞書の語の並びを、1 語として変換するように覚える。文の途中に現れた時にも使う。
+    /// 並びの最初か最後の語が辞書に無ければ、覚えずに `false` を返す。
+    pub fn learn_phrase(&mut self, words: &[(String, String)]) -> bool {
+        let (Some((first_reading, first_surface)), Some((last_reading, last_surface))) = (words.first(), words.last())
+        else {
+            return false;
+        };
+        let (Some(first), Some(last)) = (
+            self.entry(first_reading, first_surface),
+            self.entry(last_reading, last_surface),
+        ) else {
+            return false;
+        };
+        let (lid, rid) = (first.lid, last.rid);
+        let reading: String = words.iter().map(|(reading, _)| reading.as_str()).collect();
+        let surface: String = words.iter().map(|(_, surface)| surface.as_str()).collect();
+        // 辞書だけで変換した時の最良の経路に、文頭・文末への連接を含めて勝つコストにする。
+        let lattice = Lattice::build(&self.dictionary, None, &reading, false);
+        let rival = lattice.nbest(1).into_iter().next();
+        let rival_ends_with_particle = rival.as_ref().is_some_and(|(_, path)| {
+            path.last().is_some_and(|&index| {
+                let node = &lattice.nodes[index];
+                lattice.is_function(node) && lattice.surface(node) == lattice.node_reading(node)
+            })
+        });
+        let connections = self.dictionary.connection_cost(BOUNDARY_ID, lid)
+            + self.dictionary.connection_cost(rid, BOUNDARY_ID);
+        let winning = rival
+            .map_or(i32::MAX, |(cost, _)| cost)
+            .saturating_sub(connections)
+            .saturating_sub(PHRASE_MARGIN);
+        let cost = if rival_ends_with_particle {
+            winning
+        } else {
+            winning.min(PHRASE_COST)
+        };
+        self.phrases.longest = self.phrases.longest.max(reading.chars().count());
+        self.phrases.words.insert(
+            reading,
+            Phrase {
+                surface,
+                lid,
+                rid,
+                cost,
+            },
+        );
+        true
+    }
+
+    pub fn forget_phrase(&mut self, reading: &str) {
+        self.phrases.words.remove(reading);
+    }
+
+    /// `reading` を `surface` に変換する経路を、辞書の語の並びで返す。
+    /// 辞書の語だけで作れない表記 (ひらがなのまま、カタカナ、記号、日付) には `None` を返す。
+    pub fn words(&self, reading: &str, surface: &str) -> Option<Vec<Word>> {
+        if let Some(entry) = self.entry(reading, surface) {
+            return Some(vec![Word {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                function: self.dictionary.is_function(entry.lid),
+            }]);
+        }
+        let lattice = Lattice::build(&self.dictionary, None, reading, false);
+        let (_, path) = lattice
+            .nbest(WORD_PATHS)
+            .into_iter()
+            .find(|(_, path)| lattice.path_surface(path) == surface)?;
+        path.iter()
+            .map(|&index| {
+                let node = &lattice.nodes[index];
+                matches!(node.surface, Surface::Entry(_)).then(|| Word {
+                    reading: lattice.node_reading(node).to_string(),
+                    surface: lattice.surface(node).to_string(),
+                    function: lattice.is_function(node),
+                })
+            })
+            .collect()
+    }
+
+    /// 読みと表記が一致する辞書の語のうち、コストが最小のもの。
+    fn entry(&self, reading: &str, surface: &str) -> Option<crate::dict::Entry<'_>> {
+        let range = self.dictionary.lookup(reading)?;
+        self.dictionary
+            .entries(range)
+            .filter(|entry| entry.surface == surface)
+            .min_by_key(|entry| entry.cost)
     }
 
     pub fn with_symbols(mut self, symbols: Arc<Dictionary>) -> Self {
@@ -338,7 +502,7 @@ impl Converter {
         if reading.is_empty() {
             return Vec::new();
         }
-        let lattice = Lattice::build(&self.dictionary, reading, false);
+        let lattice = Lattice::build(&self.dictionary, Some(&self.phrases), reading, false);
         lattice
             .nbest(limit)
             .into_iter()
@@ -355,7 +519,7 @@ impl Converter {
         if reading.is_empty() {
             return None;
         }
-        Lattice::build(&self.dictionary, reading, false).open_cost()
+        Lattice::build(&self.dictionary, None, reading, false).open_cost()
     }
 
     /// 読みが文の途中 (名詞の直後) にも置かれうるものとして求めた `open_cost`。
@@ -364,7 +528,7 @@ impl Converter {
         if reading.is_empty() {
             return None;
         }
-        Lattice::build(&self.dictionary, reading, true).open_cost()
+        Lattice::build(&self.dictionary, None, reading, true).open_cost()
     }
 
     /// 読みを変換して、文節に区切る。
@@ -372,7 +536,7 @@ impl Converter {
         if reading.is_empty() {
             return Vec::new();
         }
-        let lattice = Lattice::build(&self.dictionary, reading, false);
+        let lattice = Lattice::build(&self.dictionary, Some(&self.phrases), reading, false);
         let Some((_, path)) = lattice.nbest(1).into_iter().next() else {
             return vec![self.segment(reading, None)];
         };
@@ -501,6 +665,9 @@ pub(crate) mod tests {
             ("め", 1, 1, 4000, "目"),
             ("かね", 1, 1, 5300, "鐘"),
             ("みぎ", 1, 1, 3400, "右"),
+            ("はめ", 1, 1, 3000, "羽目"),
+            ("がわ", 2, 2, 3000, "側"),
+            ("これあめ", 1, 1, 9500, "此雨"),
         ] {
             builder.add(reading, lid, rid, cost, surface);
         }
@@ -534,6 +701,124 @@ pub(crate) mod tests {
 
     fn surfaces(segment: &Segment) -> Vec<&str> {
         segment.candidates.iter().map(|c| c.surface.as_str()).collect()
+    }
+
+    fn words(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(reading, surface)| (reading.to_string(), surface.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_learned_phrase_is_converted_as_one_word() {
+        // Arrange
+        let mut converter = sample_converter();
+        assert_eq!(converter.convert("はめ", 1)[0].surface, "羽目");
+
+        // Act
+        let learned = converter.learn_phrase(&words(&[("は", "歯"), ("め", "目")]));
+
+        // Assert
+        assert!(learned);
+        assert_eq!(converter.convert("はめ", 1)[0].surface, "歯目");
+        // 文の途中でも使い、後ろの助詞と同じ文節になる。
+        let segments = converter.segments("きょうははめが");
+        let readings: Vec<&str> = segments.iter().map(|segment| segment.reading.as_str()).collect();
+        assert_eq!(readings, ["きょうは", "はめが"]);
+        assert_eq!(segments[1].candidates[0].surface, "歯目が");
+    }
+
+    #[test]
+    fn a_learned_phrase_costs_no_more_than_a_common_word() {
+        // Arrange: 「これあめ」の辞書だけの変換は「これ雨」で、コストが大きい
+        let mut converter = sample_converter();
+
+        // Act
+        converter.learn_phrase(&words(&[("これ", "これ"), ("あめ", "飴")]));
+
+        // Assert
+        // 文の途中でも使われるように、上限まで下げる。
+        let conversions = converter.convert("これあめ", 1);
+        assert_eq!(conversions[0].surface, "これ飴");
+        assert_eq!(conversions[0].cost, PHRASE_COST);
+    }
+
+    #[test]
+    fn a_phrase_read_like_a_word_and_a_particle_only_just_wins() {
+        // Arrange: 「にほんごは」の辞書だけの変換は「日本語は」
+        let mut converter = sample_converter();
+        let rival = converter.convert("にほんごは", 1)[0].clone();
+        assert_eq!(rival.surface, "日本語は");
+
+        // Act
+        converter.learn_phrase(&words(&[("にほんご", "日本語"), ("は", "歯")]));
+
+        // Assert
+        // 上限まで下げると、「日本語は」で始まる文がどれも「日本語歯」になる。
+        let conversions = converter.convert("にほんごは", 1);
+        assert_eq!(conversions[0].surface, "日本語歯");
+        assert_eq!(conversions[0].cost, rival.cost - PHRASE_MARGIN);
+    }
+
+    #[test]
+    fn a_learned_phrase_does_not_change_the_cost_used_for_judging() {
+        // Arrange
+        let mut converter = sample_converter();
+        let open_cost = converter.open_cost("はめ");
+        let flow_cost = converter.flow_cost("はめ");
+
+        // Act
+        converter.learn_phrase(&words(&[("は", "歯"), ("め", "目")]));
+
+        // Assert
+        // 表記の学習で、英語か日本語かの判定が変わらないようにする。
+        assert_eq!(converter.open_cost("はめ"), open_cost);
+        assert_eq!(converter.flow_cost("はめ"), flow_cost);
+    }
+
+    #[test]
+    fn a_phrase_of_words_missing_from_the_dictionary_is_not_learned() {
+        // Arrange
+        let mut converter = sample_converter();
+
+        // Act
+        let learned = converter.learn_phrase(&words(&[("は", "葉"), ("め", "目")]));
+
+        // Assert
+        assert!(!learned);
+        assert_eq!(converter.convert("はめ", 1)[0].surface, "羽目");
+    }
+
+    #[test]
+    fn a_forgotten_phrase_is_not_used() {
+        // Arrange
+        let mut converter = sample_converter();
+        converter.learn_phrase(&words(&[("は", "歯"), ("め", "目")]));
+
+        // Act
+        converter.forget_phrase("はめ");
+
+        // Assert
+        assert_eq!(converter.convert("はめ", 1)[0].surface, "羽目");
+    }
+
+    #[test]
+    fn a_surface_is_split_into_dictionary_words() {
+        // Arrange
+        let converter = sample_converter();
+
+        // Act
+        let found = converter.words("はめが", "歯目が").expect("made of dictionary words");
+
+        // Assert
+        let pairs: Vec<(&str, &str, bool)> = found
+            .iter()
+            .map(|word| (word.reading.as_str(), word.surface.as_str(), word.function))
+            .collect();
+        assert_eq!(pairs, [("は", "歯", false), ("め", "目", false), ("が", "が", true)]);
+        // 辞書に無いかなをそのまま通した表記は、語の並びにならない。
+        assert_eq!(converter.words("はれれ", "晴れれ"), None);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! 利用者の選択の記録。変換で選んだ表記と、英語・日本語の判定の訂正を覚える。
+//! 利用者の選択の記録。変換で選んだ表記、区切り直して確定した語、英語・日本語の判定の訂正を覚える。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -11,12 +11,27 @@ use crate::rules::Language;
 
 /// 1 つの読みについて覚えておく表記の数。
 const SURFACES_PER_READING: usize = 8;
+/// 覚えておく語の数。変換のたびに読みの各位置で引くので、際限なく増やさない。
+const PHRASES: usize = 1000;
+
+/// 利用者が文節を区切り直して確定した範囲。読みを 1 語の表記として変換する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Phrase {
+    reading: String,
+    surface: String,
+    /// 語を作っている辞書の語の `(読み, 表記)`。辞書を作り直すと文脈 ID が変わりうるので、
+    /// ID ではなく語を覚えておき、起動のたびに辞書から引き直す。
+    words: Vec<(String, String)>,
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Learning {
     /// 読みごとの、選ばれた表記。新しく選んだものが先頭。
     #[serde(default)]
     conversions: BTreeMap<String, Vec<String>>,
+    /// 新しく覚えたものが先頭。読みは重複しない。
+    #[serde(default)]
+    phrases: Vec<Phrase>,
     #[serde(default)]
     english_words: BTreeSet<String>,
     /// `english_words` のうち、日本語の入力が続いている間に訂正されたもの。
@@ -74,6 +89,36 @@ impl Learning {
         self.conversions.get(reading).map_or(&[], Vec::as_slice)
     }
 
+    /// 覚えた語を、語を作っている辞書の語 `(読み, 表記)` の並びで返す。
+    pub fn phrases(&self) -> impl Iterator<Item = &[(String, String)]> {
+        self.phrases.iter().map(|phrase| phrase.words.as_slice())
+    }
+
+    /// `reading` を読みとする覚えた語の表記。
+    pub fn phrase(&self, reading: &str) -> Option<&str> {
+        self.phrases
+            .iter()
+            .find(|phrase| phrase.reading == reading)
+            .map(|phrase| phrase.surface.as_str())
+    }
+
+    /// `reading` の語を新しく覚えると数の上限で忘れることになる語の読み。
+    pub fn phrase_to_drop(&self, reading: &str) -> Option<&str> {
+        if self.phrases.len() < PHRASES || self.phrase(reading).is_some() {
+            return None;
+        }
+        self.phrases.last().map(|phrase| phrase.reading.as_str())
+    }
+
+    /// 読みに `part` を含む文節のうち、選んだ表記を覚えているものの読み。`part` そのものは含めない。
+    pub fn readings_containing(&self, part: &str) -> Vec<String> {
+        self.conversions
+            .keys()
+            .filter(|reading| reading.as_str() != part && reading.contains(part))
+            .cloned()
+            .collect()
+    }
+
     /// 覚えた単語を `(単語, 言語, 日本語の入力中に訂正されたか)` の組で返す。
     pub fn languages(&self) -> impl Iterator<Item = (&str, Language, bool)> {
         let english = self
@@ -95,6 +140,52 @@ impl Learning {
             surfaces.truncate(SURFACES_PER_READING);
             self.unsaved = true;
         }
+        self.save()
+    }
+
+    /// `reading` の文節で選んだ表記のうち、`keep` が false を返すものを忘れる。
+    pub fn retain_conversions(&mut self, reading: &str, keep: impl Fn(&str) -> bool) -> io::Result<()> {
+        if let Some(surfaces) = self.conversions.get_mut(reading) {
+            let count = surfaces.len();
+            surfaces.retain(|surface| keep(surface));
+            self.unsaved |= surfaces.len() != count;
+            if surfaces.is_empty() {
+                self.conversions.remove(reading);
+            }
+        }
+        self.save()
+    }
+
+    /// 辞書の語の並びを、1 語として覚える。
+    pub fn record_phrase(&mut self, words: &[(String, String)]) -> io::Result<()> {
+        let phrase = Phrase {
+            reading: words.iter().map(|(reading, _)| reading.as_str()).collect(),
+            surface: words.iter().map(|(_, surface)| surface.as_str()).collect(),
+            words: words.to_vec(),
+        };
+        if self.phrases.first() != Some(&phrase) {
+            self.phrases.retain(|known| known.reading != phrase.reading);
+            self.phrases.insert(0, phrase);
+            self.phrases.truncate(PHRASES);
+            self.unsaved = true;
+        }
+        self.save()
+    }
+
+    /// 覚えた語を忘れる。その語を使って確定した文節の表記も忘れる。残すと、助詞を付けて
+    /// 確定したことのある読みでは、忘れた語が先頭に出続ける。
+    pub fn forget_phrase(&mut self, reading: &str) -> io::Result<()> {
+        let Some(index) = self.phrases.iter().position(|known| known.reading == reading) else {
+            return self.save();
+        };
+        let phrase = self.phrases.remove(index);
+        for (known, surfaces) in &mut self.conversions {
+            if known != reading && known.contains(reading) {
+                surfaces.retain(|surface| !surface.contains(&phrase.surface));
+            }
+        }
+        self.conversions.retain(|_, surfaces| !surfaces.is_empty());
+        self.unsaved = true;
         self.save()
     }
 
@@ -174,6 +265,91 @@ mod tests {
         assert_eq!(surfaces[0], format!("表記{}", SURFACES_PER_READING + 2));
     }
 
+    fn words(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(reading, surface)| (reading.to_string(), surface.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_latest_phrase_replaces_the_one_with_the_same_reading() {
+        // Arrange
+        let mut learning = Learning::in_memory();
+
+        // Act
+        learning.record_phrase(&words(&[("かよい", "通い"), ("じ", "時")])).expect("recorded");
+        learning.record_phrase(&words(&[("に", "二"), ("じ", "時")])).expect("recorded");
+        learning.record_phrase(&words(&[("かよい", "通い"), ("じ", "路")])).expect("recorded");
+
+        // Assert
+        assert_eq!(learning.phrase("かよいじ"), Some("通い路"));
+        let phrases: Vec<_> = learning.phrases().collect();
+        assert_eq!(phrases, [words(&[("かよい", "通い"), ("じ", "路")]), words(&[("に", "二"), ("じ", "時")])]);
+    }
+
+    #[test]
+    fn the_oldest_phrase_is_dropped_beyond_the_limit() {
+        // Arrange
+        let mut learning = Learning::in_memory();
+        for index in 0..PHRASES {
+            let reading = format!("よみ{index}");
+            learning.record_phrase(&words(&[(reading.as_str(), "語"), ("ご", "後")])).expect("recorded");
+        }
+
+        // Act
+        let known = learning.phrase_to_drop("よみ3ご").map(str::to_string);
+        let dropped = learning.phrase_to_drop("あたらしいご").map(str::to_string);
+        learning.record_phrase(&words(&[("あたらしい", "新しい"), ("ご", "語")])).expect("recorded");
+
+        // Assert
+        // すでに覚えている読みを覚え直す時は、何も忘れない。
+        assert_eq!(known, None);
+        assert_eq!(dropped.as_deref(), Some("よみ0ご"));
+        assert_eq!(learning.phrases().count(), PHRASES);
+        assert_eq!(learning.phrase("よみ0ご"), None);
+        assert_eq!(learning.phrase("よみ1ご"), Some("語後"));
+    }
+
+    #[test]
+    fn forgetting_a_phrase_forgets_the_segments_committed_with_it() {
+        // Arrange
+        let mut learning = Learning::in_memory();
+        learning.record_phrase(&words(&[("かよい", "通い"), ("じ", "路")])).expect("recorded");
+        learning.record_conversion("かよいじを", "通い路を").expect("recorded");
+        learning.record_conversion("かよいじが", "通地が").expect("recorded");
+
+        // Act
+        learning.forget_phrase("かよいじ").expect("forgotten");
+
+        // Assert
+        assert_eq!(learning.phrase("かよいじ"), None);
+        assert!(learning.conversions("かよいじを").is_empty());
+        // 語を使っていない選択は残す。
+        assert_eq!(learning.conversions("かよいじが"), ["通地が"]);
+    }
+
+    #[test]
+    fn conversions_are_found_by_a_part_of_the_reading_and_trimmed() {
+        // Arrange
+        let mut learning = Learning::in_memory();
+        learning.record_conversion("かよいじを", "通地を").expect("recorded");
+        learning.record_conversion("かよいじを", "通い路を").expect("recorded");
+        learning.record_conversion("かよいじ", "通地").expect("recorded");
+        learning.record_conversion("こうきゅう", "恒久").expect("recorded");
+
+        // Act
+        let readings = learning.readings_containing("かよいじ");
+        learning
+            .retain_conversions("かよいじを", |surface| surface.contains("通い路"))
+            .expect("saved");
+
+        // Assert
+        assert_eq!(readings, ["かよいじを"]);
+        assert_eq!(learning.conversions("かよいじを"), ["通い路を"]);
+        assert_eq!(learning.conversions("こうきゅう"), ["恒久"]);
+    }
+
     #[test]
     fn a_word_belongs_to_one_language_at_a_time() {
         // Arrange
@@ -215,6 +391,7 @@ mod tests {
         let path = temporary_file("reload");
         let mut learning = Learning::load(&path).expect("missing file is an empty record");
         learning.record_conversion("あめ", "飴").expect("saved");
+        learning.record_phrase(&words(&[("かよい", "通い"), ("じ", "路")])).expect("saved");
         learning.record_language("sore", Language::Japanese, false).expect("saved");
         learning.record_language("made", Language::English, true).expect("saved");
 
@@ -223,6 +400,8 @@ mod tests {
 
         // Assert
         assert_eq!(reloaded.conversions("あめ"), ["飴"]);
+        assert_eq!(reloaded.phrase("かよいじ"), Some("通い路"));
+        assert_eq!(reloaded.phrases().next(), Some(words(&[("かよい", "通い"), ("じ", "路")]).as_slice()));
         assert_eq!(
             reloaded.languages().collect::<Vec<_>>(),
             [("made", Language::English, true), ("sore", Language::Japanese, false)]

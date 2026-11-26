@@ -15,7 +15,7 @@
 //!
 //! `Direct` での判定と仮の日本語入力は、自動切り替え (`InputMode::Auto`) の時の動作。
 //! 日本語入力 (`InputMode::Japanese`) では判定をせず、文字のキーはすべて `Composing` から始める。
-//! 直接入力 (`InputMode::Direct`) の間は、すべての打鍵をそのまま入力先へ通す。
+//! 直接入力 (`InputMode::Direct`) の間は、入力モードを切り替えるキー以外の打鍵をそのまま入力先へ通す。
 
 use std::io;
 
@@ -94,7 +94,7 @@ pub enum Key {
     /// (`EngineConfig::auto_switch`)。日本語入力の時は何もしない。自動切り替えの時は、かなを変換する。
     /// 入力中でなければ、次の入力を日本語として始める。
     Henkan,
-    /// 無変換キー (JIS 配列の「英数」)。直接入力にする。
+    /// 無変換キー (JIS 配列の「英数」)。直接入力にする。直接入力の時は何もしない。
     Muhenkan,
     /// 直前の単語、または入力中の単語を日本語として読み直す。
     ForceJapanese,
@@ -166,7 +166,7 @@ pub enum InputMode {
     Japanese,
     /// 英語か日本語かを判定しながら入力する。
     Auto,
-    /// すべての打鍵をそのまま入力先へ通す。
+    /// 入力モードを切り替えるキー以外の打鍵を、そのまま入力先へ通す。
     Direct,
 }
 
@@ -541,10 +541,12 @@ impl Engine {
     /// 打鍵を 1 つ処理する。`time_ms` は単調増加する時刻。
     pub fn handle(&mut self, key: Key, time_ms: u64) -> Output {
         if self.input_mode == InputMode::Direct {
-            if key != Key::Henkan {
-                return Output::default();
-            }
-            return self.set_input_mode(self.config.kana_key_mode());
+            return match key {
+                Key::Henkan => self.set_input_mode(self.config.kana_key_mode()),
+                // すでに直接入力なので、何も変えない。入力先へ通すと、このキーで空白を入力する入力先がある。
+                Key::Muhenkan => self.output(Step::consume()),
+                _ => Output::default(),
+            };
         }
         if key == Key::Muhenkan {
             return self.set_input_mode(InputMode::Direct);
@@ -2469,6 +2471,23 @@ mod tests {
 
         // Assert
         assert_eq!(simulator.text, "きょうkyou ");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn muhenkan_in_direct_input_changes_nothing() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{muhenkan}home");
+
+        // Act
+        let output = simulator.engine.handle(Key::Muhenkan, 10_000);
+
+        // Assert
+        // 入力先へ通すと、空白を入力する入力先がある。
+        assert!(output.consumed);
+        assert_eq!(output.commit, "");
+        assert_eq!(output.preedit, "");
         assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
     }
 

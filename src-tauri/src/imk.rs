@@ -25,14 +25,17 @@ use crate::overlay::{self, Rect};
 /// Info.plist で、入力メソッドの接続名を指定するキー。
 const CONNECTION_NAME_KEY: &str = "InputMethodConnectionName";
 /// Info.plist の `ComponentInputModeDict` に書いた、入力モードの ID。メニューバーのアイコンはモードごとに決まる。
-/// 日本語入力と自動切り替えは、OS から見ると同じ入力モード。「かな」キーでどちらに入るかは設定で決まる。
 const JAPANESE_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Japanese";
+const AUTO_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Auto";
 const DIRECT_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Roman";
 /// `setValue:forTag:client:` で、入力モードの切り替えを表すタグ (`kTextServiceInputModePropertyTag`、'imod')。
 const INPUT_MODE_TAG: isize = 0x696D_6F64;
 /// OS が入力モードを切り替えた直後に届く「かな」キーを、切り替えの一部とみなす時間。
 /// 自動切り替えでこのキーを打鍵として扱うと、切り替えた直後に「次の入力を日本語にする」指定が入ってしまう。
 const MODE_SWITCH_SETTLE: Duration = Duration::from_millis(300);
+/// OS の入力モードをエンジンに合わせ直した後、次に合わせ直すまで空ける時間。
+/// OS が合わせ直しを受け付けずに元の入力モードを通知し返すと、空けなければ合わせ直しが終わらない。
+const MODE_SYNC_INTERVAL: Duration = Duration::from_millis(300);
 
 struct Runtime {
     app: AppHandle,
@@ -46,6 +49,8 @@ struct Runtime {
     last_view: View,
     /// OS が最後に入力モードを切り替えた時刻。
     mode_switched_at: Option<Instant>,
+    /// OS の入力モードをエンジンに合わせ直すのを予約した時刻と、合わせ直す入力先。
+    mode_sync: Option<(Instant, Retained<AnyObject>)>,
     /// 入力先の切り替えなどで、未確定文字列をまとめて確定した回数。
     commit_count: u64,
     /// 保持していないと、OS からの接続を受けられなくなる。
@@ -161,10 +166,12 @@ fn show_window(show: fn(&AppHandle) -> tauri::Result<()>) {
 /// 設定をエンジンに反映する。入力モードが変わる時は、入力中の文字列を入力先に確定する。
 /// メインスレッドで呼ぶ。
 pub fn set_config(engine: &Mutex<Engine>, config: EngineConfig) {
-    let (output, view) = {
+    let (output, view, new_mode) = {
         let mut engine = engine.lock().expect("engine lock");
+        let mode_before = engine.input_mode();
         let output = engine.set_config(config);
-        (output, engine.view())
+        let mode = engine.input_mode();
+        (output, engine.view(), (mode != mode_before).then_some(mode))
     };
     let client = RUNTIME.with(|runtime| runtime.borrow().as_ref().and_then(|runtime| runtime.client.clone()));
     let Some(client) = client else {
@@ -172,6 +179,37 @@ pub fn set_config(engine: &Mutex<Engine>, config: EngineConfig) {
     };
     apply(&client, output);
     refresh_overlay(&client, view);
+    if let Some(mode) = new_mode {
+        select_mode(&client, mode);
+    }
+}
+
+fn mode_id(mode: InputMode) -> &'static str {
+    match mode {
+        InputMode::Japanese => JAPANESE_MODE_ID,
+        InputMode::Auto => AUTO_MODE_ID,
+        InputMode::Direct => DIRECT_MODE_ID,
+    }
+}
+
+/// エンジンの入力モードを OS に伝える。メニューバーのアイコンが変わる。
+fn select_mode(client: &AnyObject, mode: InputMode) {
+    let identifier = NSString::from_str(mode_id(mode));
+    // SAFETY: `selectInputMode:` は IMKTextInput のメソッド。
+    let _: () = unsafe { msg_send![client, selectInputMode: &*identifier] };
+}
+
+/// OS が選んだ入力モードに対して、エンジンが入るモード。
+///
+/// OS は、日本語入力と自動切り替えのどちらが設定されているかを知らない。「かな」キーでは、いつも
+/// 同じ側の入力モードを選ぶ。日本語の側の入力モードが選ばれた時は、どちらが選ばれたかによらず、
+/// 設定で決まるモード (`kana_key_mode`) に入る。
+fn mode_for(identifier: &str, kana_key_mode: InputMode) -> InputMode {
+    if identifier == DIRECT_MODE_ID {
+        InputMode::Direct
+    } else {
+        kana_key_mode
+    }
 }
 
 /// 入力メソッドのサーバーを起動する。入力メソッドのバンドルとして起動されていなければ `false` を返す。
@@ -202,6 +240,7 @@ pub fn start(app: AppHandle, engine: Arc<Mutex<Engine>>) -> bool {
             has_preedit: false,
             last_view,
             mode_switched_at: None,
+            mode_sync: None,
             commit_count: 0,
             _server: server,
         });
@@ -246,6 +285,10 @@ fn handle_key(event: &NSEvent, client: &AnyObject) -> bool {
     let Some((key, reread)) = prepared else {
         return false;
     };
+    // エンジンには渡さないが、入力先にも通さない。通すと、このキーで空白を入力する入力先がある。
+    if key == Key::Henkan && mode_just_switched() {
+        return true;
+    }
     // 確定済みの単語の読み直しは、その単語がキャレットの直前にある時だけ行う。無ければエンジンに
     // 渡さずに、キーを入力先へ通す。渡してしまうと、単語を日本語として覚えた上に、未確定文字列が
     // その時の選択範囲を置き換える。
@@ -258,13 +301,7 @@ fn handle_key(event: &NSEvent, client: &AnyObject) -> bool {
         // SAFETY: `client` は、この呼び出しの間有効な入力先のオブジェクト。
         runtime.client = unsafe { Retained::retain(client as *const AnyObject as *mut AnyObject) };
         let now = runtime.started.elapsed().as_millis() as u64;
-        let just_switched = runtime
-            .mode_switched_at
-            .is_some_and(|switched| switched.elapsed() < MODE_SWITCH_SETTLE);
         let mut engine = runtime.engine.lock().expect("engine lock");
-        if key == Key::Henkan && just_switched {
-            return None;
-        }
         let mode_before = engine.input_mode();
         let output = engine.handle(key, now);
         if let Some(error) = engine.take_error() {
@@ -281,18 +318,22 @@ fn handle_key(event: &NSEvent, client: &AnyObject) -> bool {
     apply(client, output);
     refresh_overlay(client, view);
     if let Some(mode) = new_mode {
-        // キーで切り替えた入力モードを OS に伝える。メニューバーのアイコンが変わる。
-        let identifier = NSString::from_str(match mode {
-            InputMode::Japanese | InputMode::Auto => JAPANESE_MODE_ID,
-            InputMode::Direct => DIRECT_MODE_ID,
-        });
-        // SAFETY: `selectInputMode:` は IMKTextInput のメソッド。
-        let _: () = unsafe { msg_send![client, selectInputMode: &*identifier] };
+        select_mode(client, mode);
     }
     if let Some(delay) = deadline {
         schedule_timeout(Duration::from_millis(delay + 1));
     }
     consumed
+}
+
+fn mode_just_switched() -> bool {
+    RUNTIME.with(|runtime| {
+        runtime
+            .borrow()
+            .as_ref()
+            .and_then(|runtime| runtime.mode_switched_at)
+            .is_some_and(|switched| switched.elapsed() < MODE_SWITCH_SETTLE)
+    })
 }
 
 /// 読み直す単語がキャレットの直前にあれば、その範囲を返す。選択範囲がある時は `None`。
@@ -460,28 +501,72 @@ fn mode_selected(value: Option<&AnyObject>, client: Option<&AnyObject>) {
     let Some(identifier) = value.and_then(|value| value.downcast_ref::<NSString>()) else {
         return;
     };
-    let direct = identifier.to_string() == DIRECT_MODE_ID;
-    let switched = RUNTIME.with(|runtime| {
+    let identifier = identifier.to_string();
+    let selected = RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
         let runtime = runtime.as_mut()?;
         let mut engine = runtime.engine.lock().expect("engine lock");
-        let mode = if direct {
-            InputMode::Direct
-        } else {
-            engine.kana_key_mode()
-        };
+        let mode = mode_for(&identifier, engine.kana_key_mode());
         // 同じモードの通知 (キーで切り替えた時に OS へ伝えた分の折り返しなど) は、切り替えとして扱わない。
         if engine.input_mode() == mode {
-            return None;
+            return Some((mode, None));
         }
         runtime.mode_switched_at = Some(Instant::now());
-        Some((engine.set_input_mode(mode), engine.view()))
+        Some((mode, Some((engine.set_input_mode(mode), engine.view()))))
     });
-    let (Some((output, view)), Some(client)) = (switched, client) else {
+    let (Some((mode, switched)), Some(client)) = (selected, client) else {
         return;
     };
-    apply(client, output);
-    refresh_overlay(client, view);
+    if let Some((output, view)) = switched {
+        apply(client, output);
+        refresh_overlay(client, view);
+    }
+    if identifier != mode_id(mode) {
+        schedule_mode_sync(client);
+    }
+}
+
+/// OS が選んだ入力モードがエンジンのモードと違う時に、OS の入力モードをエンジンに合わせ直す。
+///
+/// OS が入力モードを切り替えている最中 (`setValue:forTag:client:` の中) に別の入力モードを選ぶと、
+/// OS の切り替えが後から終わって上書きされるおそれがある。イベントループに戻ってから選び直す。
+fn schedule_mode_sync(client: &AnyObject) {
+    let app = RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let runtime = runtime.as_mut()?;
+        let recently = runtime
+            .mode_sync
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < MODE_SYNC_INTERVAL);
+        if recently {
+            return None;
+        }
+        // SAFETY: `client` は、この呼び出しの間有効な入力先のオブジェクト。
+        let client = unsafe { Retained::retain(client as *const AnyObject as *mut AnyObject) }?;
+        runtime.mode_sync = Some((Instant::now(), client));
+        Some(runtime.app.clone())
+    });
+    let Some(app) = app else {
+        return;
+    };
+    // メインスレッドから `run_on_main_thread` を呼ぶと、その場で実行される。別のスレッドから呼んで、
+    // イベントループに積む。
+    thread::spawn(move || {
+        let _ = app.run_on_main_thread(sync_mode);
+    });
+}
+
+fn sync_mode() {
+    let target = RUNTIME.with(|runtime| {
+        let runtime = runtime.borrow();
+        let runtime = runtime.as_ref()?;
+        let (_, client) = runtime.mode_sync.as_ref()?;
+        let mode = runtime.engine.lock().expect("engine lock").input_mode();
+        Some((client.clone(), mode))
+    });
+    if let Some((client, mode)) = target {
+        select_mode(&client, mode);
+    }
 }
 
 /// 打鍵の間隔が空いたら、判定中の単語を英語として確定する。
@@ -511,5 +596,42 @@ fn fire_timeout() {
     });
     if let Some((client, output)) = fired {
         apply(&client, output);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODES: [InputMode; 3] = [InputMode::Japanese, InputMode::Auto, InputMode::Direct];
+
+    #[test]
+    fn every_input_mode_is_declared_in_the_info_plist() {
+        // Arrange
+        let info_plist = include_str!("../Info.plist");
+
+        for mode in MODES {
+            // Act
+            let identifier = mode_id(mode);
+
+            // Assert
+            // ID が食い違うと、OS は切り替えを黙って無視する。メニューバーのアイコンが変わらなくなる。
+            assert!(info_plist.contains(&format!("<key>{identifier}</key>")), "{identifier}");
+            assert!(info_plist.contains(&format!("<string>{identifier}</string>")), "{identifier}");
+        }
+    }
+
+    #[test]
+    fn a_japanese_side_mode_chosen_by_the_os_follows_the_setting() {
+        // 「かな」キーで OS が選ぶ入力モードは、設定と違う側のことがある。
+        assert_eq!(mode_for(JAPANESE_MODE_ID, InputMode::Auto), InputMode::Auto);
+        assert_eq!(mode_for(AUTO_MODE_ID, InputMode::Japanese), InputMode::Japanese);
+        assert_eq!(mode_for(JAPANESE_MODE_ID, InputMode::Japanese), InputMode::Japanese);
+    }
+
+    #[test]
+    fn the_roman_mode_chosen_by_the_os_is_direct_input() {
+        assert_eq!(mode_for(DIRECT_MODE_ID, InputMode::Japanese), InputMode::Direct);
+        assert_eq!(mode_for(DIRECT_MODE_ID, InputMode::Auto), InputMode::Direct);
     }
 }

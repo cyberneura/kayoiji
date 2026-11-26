@@ -31,9 +31,16 @@ pnpm pad                     # KayoijiPad を開発モードで起動する
   テストは小さな辞書 (`converter::tests::sample_dictionary`) で動くので、実辞書は要らない
 - エンジンの既定は日本語入力 (`EngineConfig::auto_switch` が false)。判定を通る場面のテストは `simulator()`
   (自動切り替え)、日本語入力のテストは `simulator_with(false)` で書く。`kayoiji-cli` はいつも自動切り替えで動く
-- OS の入力モード (`Info.plist` の `ComponentInputModeDict`) は増やさない。登録済みのバンドルに足した
-  入力モードを、OS がログインし直さずに認識するかは確かめられていない。日本語入力と自動切り替えは、
-  同じ入力モード ID のまま設定で切り替える
+- エンジンの入力モードごとに、OS の入力モード (`Info.plist` の `ComponentInputModeDict`) が 1 つある。
+  メニューバーのアイコンは OS の入力モードで決まるので、エンジンのモードが変わったら
+  `imk.rs` の `select_mode` で OS に伝える。OS が選んだ日本語の側の入力モードは、どちらであっても
+  設定 (`auto_switch`) の側のモードとして扱い、OS の入力モードをそれに合わせ直す (`mode_for`)。
+  OS は「かな」キーで設定と違う側を選ぶことがあるため
+- OS の入力モードを増やすと、登録済みの利用者は増えたモードが無効のままになる。インストールの
+  スクリプトが有効にするが、OS が認識していない時はログインし直す必要がある
+- メニューバーのアイコンは `scripts/make-menu-icon.swift` で作る
+- キーの動作を変えたら、その動作を説明している 3 か所を合わせる。`README.md` のキー操作の表、
+  設定画面の表 (`src/routes/settings`)、候補ウインドウの案内 (`src/routes/overlay`)
 - 判定のしきい値や規則を変えたら、`kayoiji-cli evaluate` を実行して、変更前後の数値を比べる。
   個別の単語は `kayoiji-cli explain <単語>` で値を見る
 - エンジンの挙動は、まず KayoijiPad (`pnpm pad`) で確認する。OS の入力ソースが英字の時だけ内蔵のエンジンが動く

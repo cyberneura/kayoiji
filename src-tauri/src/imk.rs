@@ -33,9 +33,9 @@ const INPUT_MODE_TAG: isize = 0x696D_6F64;
 /// OS が入力モードを切り替えた直後に届く「かな」キーを、切り替えの一部とみなす時間。
 /// 自動切り替えでこのキーを打鍵として扱うと、切り替えた直後に「次の入力を日本語にする」指定が入ってしまう。
 const MODE_SWITCH_SETTLE: Duration = Duration::from_millis(300);
-/// OS の入力モードをエンジンに合わせ直した後、次に合わせ直すまで空ける時間。
-/// OS が合わせ直しを受け付けずに元の入力モードを通知し返すと、空けなければ合わせ直しが終わらない。
-const MODE_SYNC_INTERVAL: Duration = Duration::from_millis(300);
+/// OS の入力モードをエンジンに合わせ直すのを、続けて試す回数。OS が合わせ直しを受け付けずに
+/// 元の入力モードを通知し返すと、打ち切らなければ合わせ直しが終わらない。
+const MODE_SYNC_ATTEMPTS: u32 = 3;
 
 struct Runtime {
     app: AppHandle,
@@ -49,8 +49,10 @@ struct Runtime {
     last_view: View,
     /// OS が最後に入力モードを切り替えた時刻。
     mode_switched_at: Option<Instant>,
-    /// OS の入力モードをエンジンに合わせ直すのを予約した時刻と、合わせ直す入力先。
-    mode_sync: Option<(Instant, Retained<AnyObject>)>,
+    /// OS の入力モードをエンジンに合わせ直す予約。合わせ直す入力先を持つ。
+    mode_sync: Option<Retained<AnyObject>>,
+    /// OS の入力モードがエンジンと一致しないまま、続けて合わせ直しを予約した回数。
+    mode_sync_attempts: u32,
     /// 入力先の切り替えなどで、未確定文字列をまとめて確定した回数。
     commit_count: u64,
     /// 保持していないと、OS からの接続を受けられなくなる。
@@ -121,6 +123,15 @@ define_class!(
             let Some(app) = app_handle() else {
                 return;
             };
+            // 入力メソッドを選んでから 1 度も打鍵していないと、入力先をまだ覚えていない。
+            // 覚えていないと、切り替えた入力モードを OS に伝えられず、アイコンが変わらない。
+            // SAFETY: `client` は IMKInputController のメソッドで、今の入力先か nil を返す。
+            let client: Option<Retained<AnyObject>> = unsafe { msg_send![self, client] };
+            RUNTIME.with(|runtime| {
+                if let Some(runtime) = runtime.borrow_mut().as_mut() {
+                    runtime.client = runtime.client.take().or(client);
+                }
+            });
             if let Err(error) = crate::toggle_auto_switch(&app) {
                 eprintln!("kayoiji: could not save the settings: {error}");
             }
@@ -241,6 +252,7 @@ pub fn start(app: AppHandle, engine: Arc<Mutex<Engine>>) -> bool {
             last_view,
             mode_switched_at: None,
             mode_sync: None,
+            mode_sync_attempts: 0,
             commit_count: 0,
             _server: server,
         });
@@ -466,6 +478,8 @@ fn commit_all(client: Option<&AnyObject>) {
         let mut runtime = runtime.borrow_mut();
         let runtime = runtime.as_mut()?;
         runtime.client = None;
+        // 入力先が替わった後に、前の入力先へ入力モードの切り替えを送らない。
+        runtime.mode_sync = None;
         runtime.commit_count += 1;
         let mut engine = runtime.engine.lock().expect("engine lock");
         let commit = engine.commit_composition();
@@ -507,6 +521,9 @@ fn mode_selected(value: Option<&AnyObject>, client: Option<&AnyObject>) {
         let runtime = runtime.as_mut()?;
         let mut engine = runtime.engine.lock().expect("engine lock");
         let mode = mode_for(&identifier, engine.kana_key_mode());
+        if identifier == mode_id(mode) {
+            runtime.mode_sync_attempts = 0;
+        }
         // 同じモードの通知 (キーで切り替えた時に OS へ伝えた分の折り返しなど) は、切り替えとして扱わない。
         if engine.input_mode() == mode {
             return Some((mode, None));
@@ -534,16 +551,12 @@ fn schedule_mode_sync(client: &AnyObject) {
     let app = RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
         let runtime = runtime.as_mut()?;
-        let recently = runtime
-            .mode_sync
-            .as_ref()
-            .is_some_and(|(at, _)| at.elapsed() < MODE_SYNC_INTERVAL);
-        if recently {
+        if runtime.mode_sync_attempts >= MODE_SYNC_ATTEMPTS {
             return None;
         }
+        runtime.mode_sync_attempts += 1;
         // SAFETY: `client` は、この呼び出しの間有効な入力先のオブジェクト。
-        let client = unsafe { Retained::retain(client as *const AnyObject as *mut AnyObject) }?;
-        runtime.mode_sync = Some((Instant::now(), client));
+        runtime.mode_sync = unsafe { Retained::retain(client as *const AnyObject as *mut AnyObject) };
         Some(runtime.app.clone())
     });
     let Some(app) = app else {
@@ -558,11 +571,11 @@ fn schedule_mode_sync(client: &AnyObject) {
 
 fn sync_mode() {
     let target = RUNTIME.with(|runtime| {
-        let runtime = runtime.borrow();
-        let runtime = runtime.as_ref()?;
-        let (_, client) = runtime.mode_sync.as_ref()?;
+        let mut runtime = runtime.borrow_mut();
+        let runtime = runtime.as_mut()?;
+        let client = runtime.mode_sync.take()?;
         let mode = runtime.engine.lock().expect("engine lock").input_mode();
-        Some((client.clone(), mode))
+        Some((client, mode))
     });
     if let Some((client, mode)) = target {
         select_mode(&client, mode);
@@ -616,8 +629,17 @@ mod tests {
 
             // Assert
             // ID が食い違うと、OS は切り替えを黙って無視する。メニューバーのアイコンが変わらなくなる。
-            assert!(info_plist.contains(&format!("<key>{identifier}</key>")), "{identifier}");
-            assert!(info_plist.contains(&format!("<string>{identifier}</string>")), "{identifier}");
+            let declared = info_plist
+                .split_once(&format!("<key>{identifier}</key>"))
+                .and_then(|(_, mode)| mode.split_once("<key>TISInputSourceID</key>"))
+                .and_then(|(_, rest)| rest.split_once("<string>"))
+                .and_then(|(_, rest)| rest.split_once("</string>"))
+                .map(|(source_id, _)| source_id);
+            assert_eq!(declared, Some(identifier));
+            let order = info_plist
+                .split_once("<key>tsVisibleInputModeOrderedArrayKey</key>")
+                .map(|(_, order)| order);
+            assert!(order.is_some_and(|order| order.contains(&format!("<string>{identifier}</string>"))));
         }
     }
 

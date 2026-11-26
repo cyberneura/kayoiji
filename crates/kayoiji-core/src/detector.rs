@@ -139,6 +139,10 @@ impl Detector {
         &self.converter
     }
 
+    pub fn converter_mut(&mut self) -> &mut Converter {
+        &mut self.converter
+    }
+
     pub fn set_config(&mut self, config: DetectorConfig) {
         self.config = config;
     }

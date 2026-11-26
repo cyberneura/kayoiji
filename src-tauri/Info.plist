@@ -45,6 +45,36 @@
 					<string>Latn</string>
 				</array>
 				<key>tsInputModeMenuIconFileKey</key>
+				<string>menu-icon-japanese.pdf</string>
+				<key>tsInputModeAlternateMenuIconFileKey</key>
+				<string>menu-icon-japanese.pdf</string>
+				<key>tsInputModePaletteIconFileKey</key>
+				<string>menu-icon-japanese.pdf</string>
+				<key>tsInputModeDefaultStateKey</key>
+				<true/>
+				<key>tsInputModeIsVisibleKey</key>
+				<true/>
+				<key>tsInputModePrimaryInScriptKey</key>
+				<true/>
+			</dict>
+			<key>com.cyberneura.inputmethod.Kayoiji.Auto</key>
+			<dict>
+				<key>TISInputSourceID</key>
+				<string>com.cyberneura.inputmethod.Kayoiji.Auto</string>
+				<key>TISIntendedLanguage</key>
+				<string>ja</string>
+				<key>TISIconIsTemplate</key>
+				<true/>
+				<key>tsInputModeScriptKey</key>
+				<string>smJapanese</string>
+				<key>tsInputModeCharacterRepertoireKey</key>
+				<array>
+					<string>Hira</string>
+					<string>Kana</string>
+					<string>Hani</string>
+					<string>Latn</string>
+				</array>
+				<key>tsInputModeMenuIconFileKey</key>
 				<string>menu-icon.pdf</string>
 				<key>tsInputModeAlternateMenuIconFileKey</key>
 				<string>menu-icon.pdf</string>
@@ -55,7 +85,7 @@
 				<key>tsInputModeIsVisibleKey</key>
 				<true/>
 				<key>tsInputModePrimaryInScriptKey</key>
-				<true/>
+				<false/>
 			</dict>
 			<key>com.cyberneura.inputmethod.Kayoiji.Roman</key>
 			<dict>
@@ -88,6 +118,7 @@
 		<key>tsVisibleInputModeOrderedArrayKey</key>
 		<array>
 			<string>com.cyberneura.inputmethod.Kayoiji.Japanese</string>
+			<string>com.cyberneura.inputmethod.Kayoiji.Auto</string>
 			<string>com.cyberneura.inputmethod.Kayoiji.Roman</string>
 		</array>
 	</dict>

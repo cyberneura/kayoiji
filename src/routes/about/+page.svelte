@@ -1,17 +1,12 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import { formatJst } from '$lib/time';
   import type { AppStatus } from '$lib/types';
 
   let status = $state<AppStatus>();
 
-  const builtAt = $derived(
-    status
-      ? new Intl.DateTimeFormat('ja-JP', { dateStyle: 'medium', timeStyle: 'medium' }).format(
-          new Date(status.built_at * 1000)
-        )
-      : ''
-  );
+  const builtAt = $derived(status ? formatJst(status.built_at) : '');
 
   onMount(async () => {
     status = await invoke<AppStatus>('app_status');

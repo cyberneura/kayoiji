@@ -2,7 +2,7 @@ export type Mode = 'direct' | 'composing' | 'converting';
 
 /**
  * `japanese` はすべての打鍵を日本語として入力する。`auto` は英語か日本語かを判定しながら入力する。
- * `direct` はすべての打鍵をそのまま通す。
+ * `direct` は、入力モードを切り替えるキー以外の打鍵をそのまま通す。
  */
 export type InputMode = 'japanese' | 'auto' | 'direct';
 

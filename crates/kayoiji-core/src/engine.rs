@@ -15,7 +15,7 @@
 //!
 //! `Direct` での判定と仮の日本語入力は、自動切り替え (`InputMode::Auto`) の時の動作。
 //! 日本語入力 (`InputMode::Japanese`) では判定をせず、文字のキーはすべて `Composing` から始める。
-//! 直接入力 (`InputMode::Direct`) の間は、すべての打鍵をそのまま入力先へ通す。
+//! 直接入力 (`InputMode::Direct`) の間は、入力モードを切り替えるキー以外の打鍵をそのまま入力先へ通す。
 
 use std::io;
 
@@ -90,11 +90,11 @@ pub enum Key {
     ShiftLeft,
     /// Shift + 右矢印。変換中の文節を伸ばす。
     ShiftRight,
-    /// 変換キー (JIS 配列の「かな」)。直接入力なら、日本語入力か自動切り替えにする
-    /// (`EngineConfig::auto_switch`)。日本語入力の時は何もしない。自動切り替えの時は、かなを変換する。
-    /// 入力中でなければ、次の入力を日本語として始める。
+    /// 変換キー (JIS 配列の「かな」)。日本語入力か自動切り替えのうち、設定の側のモード
+    /// (`EngineConfig::auto_switch`) に入る。すでにそのモードなら、日本語入力の時は何もしない。
+    /// 自動切り替えの時は、かなを変換する。入力中でなければ、次の入力を日本語として始める。
     Henkan,
-    /// 無変換キー (JIS 配列の「英数」)。直接入力にする。
+    /// 無変換キー (JIS 配列の「英数」)。直接入力にする。直接入力の時は何もしない。
     Muhenkan,
     /// 直前の単語、または入力中の単語を日本語として読み直す。
     ForceJapanese,
@@ -166,7 +166,7 @@ pub enum InputMode {
     Japanese,
     /// 英語か日本語かを判定しながら入力する。
     Auto,
-    /// すべての打鍵をそのまま入力先へ通す。
+    /// 入力モードを切り替えるキー以外の打鍵を、そのまま入力先へ通す。
     Direct,
 }
 
@@ -541,13 +541,19 @@ impl Engine {
     /// 打鍵を 1 つ処理する。`time_ms` は単調増加する時刻。
     pub fn handle(&mut self, key: Key, time_ms: u64) -> Output {
         if self.input_mode == InputMode::Direct {
-            if key != Key::Henkan {
-                return Output::default();
-            }
-            return self.set_input_mode(self.config.kana_key_mode());
+            return match key {
+                Key::Henkan => self.set_input_mode(self.config.kana_key_mode()),
+                // すでに直接入力なので、何も変えない。入力先へ通すと、このキーで空白を入力する入力先がある。
+                Key::Muhenkan => self.output(Step::consume()),
+                _ => Output::default(),
+            };
         }
         if key == Key::Muhenkan {
             return self.set_input_mode(InputMode::Direct);
+        }
+        if key == Key::Henkan && self.input_mode != self.config.kana_key_mode() {
+            // 入力ソースの一覧で、設定と違う側のモードが選ばれている。「かな」は設定の側のモードに入る。
+            return self.set_input_mode(self.config.kana_key_mode());
         }
         if self.input_mode == InputMode::Japanese && key == Key::Henkan {
             // すでに日本語入力なので、何も変えない。
@@ -2469,6 +2475,39 @@ mod tests {
 
         // Assert
         assert_eq!(simulator.text, "きょうkyou ");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn henkan_enters_the_configured_mode_from_the_other_japanese_side_mode() {
+        // Arrange: 自動切り替えは無効。入力ソースの一覧で、自動切り替えのモードが選ばれた
+        let mut simulator = simulator_with(false);
+        simulator.engine.set_input_mode(InputMode::Auto);
+        simulator.run("kyou");
+
+        // Act
+        simulator.run("{henkan}");
+
+        // Assert
+        // 入力中の文字列は、表示されているとおりに確定する。
+        assert_eq!(simulator.text, "きょう");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    #[test]
+    fn muhenkan_in_direct_input_changes_nothing() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{muhenkan}home");
+
+        // Act
+        let output = simulator.engine.handle(Key::Muhenkan, 10_000);
+
+        // Assert
+        // 入力先へ通すと、空白を入力する入力先がある。
+        assert!(output.consumed);
+        assert_eq!(output.commit, "");
+        assert_eq!(output.preedit, "");
         assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
     }
 

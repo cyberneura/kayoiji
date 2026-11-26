@@ -1,24 +1,33 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
   import type { AppStatus } from '$lib/types';
 
   let status = $state<AppStatus>();
   let error = $state('');
 
-  const keys = [
-    ['Space / 変換', '変換する / 次の候補'],
+  const commonKeys = [
+    ['Space', '変換する / 次の候補'],
     ['Enter', '確定する'],
     ['← / →', '変換中: 候補を選ぶ文節を移る'],
     ['Shift + ← / →', '変換中: 文節を縮める / 伸ばす'],
     ['1 - 9', '候補を番号で選ぶ'],
-    ['Esc', 'かなの入力中: 打ったままの英字に戻す (その単語を英語として覚える)。変換中: かなに戻る'],
-    ['Ctrl + ; / F10', 'かなの入力中でも変換中でも、打ったままの英字に戻す'],
-    ['Ctrl + J', '直前の単語を日本語として読み直す (その単語を日本語として覚える)'],
     ['Ctrl + K / F7', 'カタカナにする'],
-    ['無変換 / 英数', '直接入力にする (すべてのキーをそのまま入力する)'],
-    ['変換 / かな', '自動切り替えにする。入力中でなければ、次の入力を日本語として始める']
+    ['英数 / 無変換', '直接入力にする (すべてのキーをそのまま入力する)']
   ];
+  const japaneseKeys = [
+    ['かな / 変換', '日本語入力にする'],
+    ['Esc', 'かなの入力中: 入力を取り消す。変換中: かなに戻る'],
+    ['Ctrl + ; / F10', 'かなの入力中でも変換中でも、打ったままの英字に戻す']
+  ];
+  const autoKeys = [
+    ['かな / 変換', '自動切り替えにする。かなの入力中は変換する。入力中でなければ、次の入力を日本語として始める'],
+    ['Esc', 'かなの入力中: 打ったままの英字に戻す (その単語を英語として覚える)。変換中: かなに戻る'],
+    ['Ctrl + ; / F10', 'かなの入力中でも変換中でも、打ったままの英字に戻す (その単語を英語として覚える)'],
+    ['Ctrl + J', '直前の単語を日本語として読み直す (その単語を日本語として覚える)']
+  ];
+  const keys = $derived([...commonKeys, ...(status?.settings.auto_switch ? autoKeys : japaneseKeys)]);
 
   async function refresh() {
     status = await invoke<AppStatus>('app_status');
@@ -35,7 +44,14 @@
     await refresh();
   }
 
-  onMount(refresh);
+  onMount(() => {
+    refresh();
+    // 入力メニューから設定を変えた時に、表示を合わせる。
+    const unlisten = listen('settings-changed', refresh);
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  });
 </script>
 
 <main
@@ -74,7 +90,23 @@
     {/if}
 
     <section class="flex flex-col gap-4 rounded-lg bg-white p-4 shadow-sm dark:bg-gray-800">
-      <label class="flex flex-col gap-1">
+      <label class="flex items-start gap-2">
+        <input
+          data-annotate="input-auto-switch"
+          type="checkbox"
+          class="mt-0.5"
+          bind:checked={status.settings.auto_switch}
+          onchange={save}
+        />
+        <span class="flex flex-col gap-1">
+          <span>英語と日本語を自動で切り替える</span>
+          <span class="text-xs text-gray-500 dark:text-gray-400">
+            打った単語が英語か日本語かを判定して、キーで切り替えずに入力します。無効の時は、「かな」キーで日本語入力、「英数」キーで直接入力にします。
+          </span>
+        </span>
+      </label>
+
+      <label class="flex flex-col gap-1 {status.settings.auto_switch ? '' : 'opacity-50'}">
         <span>ひと続きの入力とみなす打鍵の間隔 (ミリ秒)</span>
         <div class="flex items-center gap-3">
           <input
@@ -88,7 +120,7 @@
             onchange={save}
           />
           <span class="text-xs text-gray-500 dark:text-gray-400">
-            これより間隔が空いた単語は、英語として確定します。
+            自動切り替えで使います。これより間隔が空いた単語は、英語として確定します。
           </span>
         </div>
       </label>
@@ -113,7 +145,10 @@
     </section>
 
     <section class="flex flex-col gap-1 text-xs text-gray-500 dark:text-gray-400">
-      <p>英語か日本語かを決め打ちする規則は、次のファイルに追加できます (入力メソッドの再起動で反映)。</p>
+      <p>
+        自動切り替えで英語か日本語かを決め打ちする規則は、次のファイルに追加できます
+        (入力メソッドの再起動で反映)。
+      </p>
       <p class="font-mono break-all">{status.rules_path}</p>
     </section>
   {/if}

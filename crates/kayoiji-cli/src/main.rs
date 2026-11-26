@@ -102,8 +102,13 @@ fn main() -> io::Result<()> {
     }
 }
 
+/// このコマンドは判定の動作を調べるためのものなので、エンジンは自動切り替えで開く。
 pub fn load_engine(data: &Path) -> io::Result<Engine> {
-    open_engine(data, RuleSet::standard(), Learning::in_memory(), EngineConfig::default())
+    let config = EngineConfig {
+        auto_switch: true,
+        ..EngineConfig::default()
+    };
+    open_engine(data, RuleSet::standard(), Learning::in_memory(), config)
 }
 
 fn explain(engine: &Engine, word: &str) {

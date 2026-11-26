@@ -18,8 +18,11 @@
     timeout_ms: number | null;
   }
 
+  /** 自動切り替えの設定を覚えておく localStorage のキー。 */
+  const AUTO_SWITCH_KEY = 'kayoiji-pad-auto-switch';
+
   const idle: View = {
-    input_mode: 'auto',
+    input_mode: 'japanese',
     forced: false,
     mode: 'direct',
     reading: '',
@@ -34,6 +37,7 @@
   let focus: [number, number] | null = null;
   let view = $state<View>(idle);
   let systemInputMethod = $state(false);
+  let autoSwitch = $state(false);
   let copied = $state(false);
   // 打鍵は届いた順に処理する。エンジンの応答を待つ間に次の打鍵が来ても、順序を入れ替えない。
   let queue: Promise<unknown> = Promise.resolve();
@@ -41,16 +45,24 @@
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
   const modeLabel = $derived(
-    systemInputMethod ? 'OS' : view.input_mode === 'direct' ? 'A' : view.forced ? 'あ' : '自動'
+    systemInputMethod
+      ? 'OS'
+      : view.input_mode === 'direct'
+        ? 'A'
+        : view.input_mode === 'japanese' || view.forced
+          ? 'あ'
+          : '自動'
   );
   const modeTitle = $derived(
     systemInputMethod
       ? 'OS の入力メソッドで入力しています。内蔵のエンジンを試す時は、入力ソースを英字にしてください。'
       : view.input_mode === 'direct'
-        ? '直接入力。クリックか「変換」で自動切り替えに戻します。'
-        : view.forced
-          ? '次の入力を日本語として始めます。'
-          : '自動切り替え。クリックか「無変換」で直接入力にします。'
+        ? `直接入力。クリックか「かな」で${autoSwitch ? '自動切り替え' : '日本語入力'}に戻します。`
+        : view.input_mode === 'japanese'
+          ? '日本語入力。クリックか「英数」で直接入力にします。'
+          : view.forced
+            ? '次の入力を日本語として始めます。'
+            : '自動切り替え。クリックか「英数」で直接入力にします。'
   );
 
   function render() {
@@ -86,12 +98,15 @@
     focus = response.focus;
     view = response.view;
     render();
+    scheduleTimeout(response.timeout_ms);
+  }
+
+  function scheduleTimeout(timeoutMs: number | null) {
     clearTimeout(timer);
-    if (response.timeout_ms !== null) {
-      timer = setTimeout(() => {
-        enqueue(async () => receive(await invoke<PadResponse>('pad_timeout'), null));
-      }, response.timeout_ms + 1);
-    }
+    if (timeoutMs === null) return;
+    timer = setTimeout(() => {
+      enqueue(async () => receive(await invoke<PadResponse>('pad_timeout'), null));
+    }, timeoutMs + 1);
   }
 
   function send(key: PadKey) {
@@ -151,6 +166,37 @@
     textarea?.focus();
   }
 
+  function setAutoSwitch(enabled: boolean) {
+    enqueue(async () => {
+      // 表示と保存は、エンジンが切り替わってから変える。呼び出しが失敗した時に、表示だけが
+      // 変わったままにならないようにする。
+      const response = await invoke<PadResponse>('pad_set_auto_switch', { enabled });
+      autoSwitch = enabled;
+      try {
+        localStorage.setItem(AUTO_SWITCH_KEY, enabled ? '1' : '0');
+      } catch {
+        // 保存できない環境 (プライベートウインドウなど) では、次の起動で既定に戻るだけ。
+      }
+      if (text.preedit) {
+        receive(response, null);
+        return;
+      }
+      // 確定する文字列が無い時は、テキストエリアを描き直さない。描き直すと、利用者がクリックで
+      // 動かしたカーソルや選択範囲が、こちらが覚えている位置に戻ってしまう。
+      view = response.view;
+      scheduleTimeout(response.timeout_ms);
+    });
+    textarea?.focus();
+  }
+
+  function savedAutoSwitch(): boolean {
+    try {
+      return localStorage.getItem(AUTO_SWITCH_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+
   async function copy() {
     await navigator.clipboard.writeText(textarea?.value ?? '');
     copied = true;
@@ -161,6 +207,7 @@
     refreshInputSource();
     // 画面を読み込み直した時に、エンジンに前の入力の状態が残らないようにする。
     release('page load');
+    setAutoSwitch(savedAutoSwitch());
     window.addEventListener('focus', refreshInputSource);
     textarea?.focus();
     return () => window.removeEventListener('focus', refreshInputSource);
@@ -201,6 +248,17 @@
         <p class="text-xs text-gray-500 dark:text-gray-400">{modeTitle}</p>
       {/if}
     </div>
+    <button
+      data-annotate="button-auto-switch"
+      class="flex h-7 shrink-0 items-center rounded border px-2 text-xs {autoSwitch
+        ? 'border-indigo-600 bg-indigo-600 text-white'
+        : 'border-gray-300 hover:bg-gray-100 dark:border-gray-600 dark:hover:bg-gray-800'}"
+      title="英語と日本語を自動で切り替える"
+      aria-pressed={autoSwitch}
+      onclick={() => setAutoSwitch(!autoSwitch)}
+    >
+      自動切り替え
+    </button>
     <button
       data-annotate="button-mode"
       class="flex h-7 min-w-9 shrink-0 items-center justify-center rounded border border-gray-300 px-2 text-xs font-medium hover:bg-gray-100 dark:border-gray-600 dark:hover:bg-gray-800"

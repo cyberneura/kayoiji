@@ -5,7 +5,7 @@
   import type { View } from '$lib/types';
 
   let view = $state<View>({
-    input_mode: 'auto',
+    input_mode: 'japanese',
     forced: false,
     mode: 'direct',
     reading: '',
@@ -65,7 +65,7 @@
     <div class="flex items-center gap-2 px-2 py-1 text-xs text-gray-500 dark:text-gray-400">
       <span>Space 変換</span>
       <span>Enter 確定</span>
-      <span>Esc 英字</span>
+      <span>{view.input_mode === 'japanese' ? 'Esc 取消' : 'Esc 英字'}</span>
     </div>
   {/if}
 </div>

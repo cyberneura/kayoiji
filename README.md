@@ -236,6 +236,18 @@ PC 用のキーボードでは、「無変換」が「英数」、「変換」�
 
 ## インストール (macOS)
 
+Apple Silicon の Mac 用。Homebrew で入れる。
+
+```sh
+brew install --cask cyberneura/tap/kayoiji
+```
+
+`~/Library/Input Methods/Kayoiji.app` に入る。入れた後に「システム設定 → キーボード → 入力ソース → 編集 → +」で
+「日本語」を選び、Kayoiji を追加する。一覧に出ない時は、ログインし直す。`brew upgrade` で新しい版に置き換えた時は、
+ログインし直すまで前の版が動いていることがある。
+
+### ソースからビルドして入れる
+
 ```sh
 pnpm install
 pnpm data                    # 辞書の元データを取得して data/build に辞書を作る (初回だけ。約 125MB を取得する)
@@ -257,6 +269,12 @@ pnpm helper                  # 英文チェックの補助プロセスを data/b
 - 新しい版を OS に登録できるまで、今の版を退避して残す。登録に失敗したら、今の版に戻す
 - 動いている古い版を止める。次に入力する時に、OS が新しい版を起動する
 - 入れ替えた後に Kayoiji の入力モードがどれも有効でなければ、先頭の入力モード (日本語入力) を有効にする
+
+## ライセンス
+
+MIT ([LICENSE](LICENSE))。同梱する第三者のライブラリと辞書・絵文字のデータのライセンスは
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) にある (アプリの `Contents/Resources` にも入っている)。
+データの出典は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ## KayoijiPad
 

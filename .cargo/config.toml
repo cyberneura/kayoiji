@@ -1,0 +1,7 @@
+# Windows 版の DLL は、Visual C++ の再頒布可能パッケージが無い Windows でも読み込めるように、C のランタイムを
+# 静的にリンクする。入力方式の DLL は入力先のアプリのプロセスに読み込まれるので、ランタイムが無いと登録もできない。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

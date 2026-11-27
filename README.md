@@ -284,7 +284,7 @@ macOS 版と同じ。英文チェックは無い (macOS のスペルチェッカ
 
 - 64 bit と 32 bit のアプリのどちらでも使えるように、両方の DLL を登録する
 - 版ごとのフォルダー (`C:\Program Files\Kayoiji\<版>`) に入れる。入れ替えた時、動いているアプリは起動し直すまで前の版で動く。
-  前の版のフォルダーは、再起動の時に消える
+  前の版のフォルダーは、次にログオンした時に消える
 - 外す時は「設定 → アプリ」で Kayoiji をアンインストールする。`%APPDATA%\Kayoiji` の設定と学習は残る
 
 ソースからは、Windows の上の bash (Git Bash) で `scripts/build-windows-installer.sh` を実行して作る (makensis が要る)。

@@ -2,7 +2,7 @@
 ;
 ; DLL は版ごとのフォルダー ($INSTDIR\<版>) に入れる。入力方式の DLL は動いているアプリが読み込んだまま
 ; 放さないので、同じ場所に上書きできない。新しい版を別のフォルダーに入れて登録し直し、古い版のフォルダーは
-; 再起動の時に消す。古い版を読み込んだアプリは、そのアプリを起動し直すまで古い版で動く。
+; 次のログオンの時に消す。古い版を読み込んだアプリは、そのアプリを起動し直すまで古い版で動く。
 
 Unicode true
 !ifndef VERSION
@@ -86,10 +86,11 @@ Section "Install"
     Abort
   ${EndIf}
 
-  ; 前の版のフォルダーは、読み込んだアプリが放してから消す。
+  ; 前の版のフォルダーは、次にログオンする時に丸ごと消す。前の版を読み込んだアプリは、テキストサービスを
+  ; 有効にし直すたびに隣の辞書を開くので、使われていないファイルだけを今消すと、そのアプリで打てなくなる。
   ${If} $1 != ""
   ${AndIf} $1 != $2
-    RMDir /r /REBOOTOK "$1"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\RunOnce" "KayoijiRemove${VERSION}" '"$SYSDIR\cmd.exe" /c rmdir /s /q "$1"'
   ${EndIf}
 
   WriteRegStr HKLM "${REGKEY}" "InstalledDir" "$2"

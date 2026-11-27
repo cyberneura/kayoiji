@@ -74,6 +74,16 @@ describe('keyFromEvent', () => {
     expect(keyFromEvent(event(' ', { shiftKey: true }), 'direct')).toEqual({ type: 'space' });
   });
 
+  it('moves the caret with the arrow keys while the English text is empty', () => {
+    // Act
+    const empty = keyFromEvent(event('ArrowLeft'), 'checking', '');
+    const typed = keyFromEvent(event('ArrowLeft'), 'checking', 'I has');
+
+    // Assert
+    expect(empty).toBeNull();
+    expect(typed).toEqual({ type: 'left' });
+  });
+
   it('does not treat a held letter as a word outside a composition', () => {
     expect(keyFromEvent(event('a', { repeat: true }), 'direct')).toBeNull();
     expect(keyFromEvent(event('a', { repeat: true }), 'composing')).toEqual({ type: 'char', value: 'a' });

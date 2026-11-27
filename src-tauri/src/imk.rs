@@ -296,17 +296,14 @@ fn start_reviewer() {
     let (Some(app), Ok(executable)) = (app_handle(), std::env::current_exe()) else {
         return;
     };
-    let started = Reviewer::start(&executable.with_file_name(REVIEW_HELPER), move |event| {
+    let reviewer = Reviewer::start(&executable.with_file_name(REVIEW_HELPER), move |event| {
         let _ = app.run_on_main_thread(move || review_event(event));
     });
-    match started {
-        Ok(reviewer) => RUNTIME.with(|runtime| {
-            if let Some(runtime) = runtime.borrow_mut().as_mut() {
-                runtime.reviewer = Some(reviewer);
-            }
-        }),
-        Err(error) => eprintln!("kayoiji: the english check works without the language model: {error}"),
-    }
+    RUNTIME.with(|runtime| {
+        if let Some(runtime) = runtime.borrow_mut().as_mut() {
+            runtime.reviewer = Some(reviewer);
+        }
+    });
 }
 
 /// 英文チェックで受け取っている英文が変わった時に、綴りを調べ直す。メインスレッドで呼ぶ。

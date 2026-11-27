@@ -34,7 +34,7 @@ struct PadState {
     engine: Mutex<Engine>,
     /// 打鍵の時刻の基準。
     started: Instant,
-    /// 英文チェックの訂正文と訳を作る補助プロセス。起動できなかった時は `None`。
+    /// 英文チェックの訂正文と訳を作る補助プロセス。終了時に捨てる。
     reviewer: Mutex<Option<Reviewer>>,
 }
 
@@ -201,7 +201,7 @@ fn data_dir(app: &App) -> tauri::Result<PathBuf> {
 fn start_reviewer(app: &App) -> Option<Reviewer> {
     let helper = std::env::current_exe().ok()?.with_file_name(REVIEW_HELPER);
     let handle = app.handle().clone();
-    let started = Reviewer::start(&helper, move |event| {
+    Some(Reviewer::start(&helper, move |event| {
         let sent = match event {
             Event::Review(review) => handle.emit(REVIEW_EVENT, review),
             Event::Failed { id } => handle.emit(REVIEW_FAILED_EVENT, id),
@@ -213,10 +213,7 @@ fn start_reviewer(app: &App) -> Option<Reviewer> {
         if let Err(error) = sent {
             eprintln!("kayoiji-pad: could not deliver a review: {error}");
         }
-    });
-    started
-        .inspect_err(|error| eprintln!("kayoiji-pad: the english check works without the language model: {error}"))
-        .ok()
+    }))
 }
 
 fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {

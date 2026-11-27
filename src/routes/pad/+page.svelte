@@ -197,7 +197,7 @@
       applyCorrection();
       return;
     }
-    const key = keyFromEvent(event, view.mode);
+    const key = keyFromEvent(event, view.mode, view.reading);
     if (!key) {
       // 修飾キーだけの打鍵では、入力を区切らない。
       if (!['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'].includes(event.key)) {

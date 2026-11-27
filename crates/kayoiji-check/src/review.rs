@@ -4,7 +4,7 @@
 //! 補助プロセスの起動も、依頼の書き込みも、答えも待たない。補助プロセスが止まっても、打鍵は止まらない。
 //! 答えが `ANSWER_TIMEOUT` を過ぎても来なければ、答えられなかったと知らせる (`Event::Failed`)。
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,9 +75,16 @@ struct Asked {
 type SharedAsked = Arc<Mutex<Option<Asked>>>;
 type OnEvent = Arc<dyn Fn(Event) + Send + Sync>;
 
-/// 起動した補助プロセス。破棄すると、プロセスを終わらせる。
+/// 補助プロセスの状態。起動は `Reviewer` のスレッドで行うので、`Reviewer` を破棄する時に、まだ起動中のことがある。
+enum Process {
+    Starting,
+    Running(Child),
+    Stopped,
+}
+
+/// 補助プロセス。破棄すると、プロセスを終わらせる。
 pub struct Reviewer {
-    child: Mutex<Child>,
+    process: Arc<Mutex<Process>>,
     requests: Mutex<Sender<(u64, String)>>,
     asked: SharedAsked,
     /// 補助プロセスが、言語モデルを使えると知らせてきたかどうか。
@@ -87,38 +94,32 @@ pub struct Reviewer {
 impl Reviewer {
     /// 補助プロセスを起動する。補助プロセスからの知らせは、別のスレッドから `on_event` に届く。
     ///
-    /// 言語モデルが使えるかどうかは、起動した後に分かる (`is_available`)。ここでは待たない。
-    pub fn start(helper: &Path, on_event: impl Fn(Event) + Send + Sync + 'static) -> io::Result<Self> {
+    /// プロセスを作るのも、言語モデルが使えるかどうかを確かめるのも、別のスレッドで行う。ここでは待たない。
+    /// 起動できなかった時は `Event::Unavailable` で知らせる。
+    pub fn start(helper: &Path, on_event: impl Fn(Event) + Send + Sync + 'static) -> Self {
         Self::start_with_timeout(helper, ANSWER_TIMEOUT, on_event)
     }
 
-    fn start_with_timeout(
-        helper: &Path,
-        timeout: Duration,
-        on_event: impl Fn(Event) + Send + Sync + 'static,
-    ) -> io::Result<Self> {
+    fn start_with_timeout(helper: &Path, timeout: Duration, on_event: impl Fn(Event) + Send + Sync + 'static) -> Self {
         let on_event: OnEvent = Arc::new(on_event);
-        let mut child = Command::new(helper)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdin = child.stdin.take().expect("stdin is piped");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        let process = Arc::new(Mutex::new(Process::Starting));
         let asked = SharedAsked::default();
         let available = Arc::new(AtomicBool::new(false));
         let (requests, queue) = mpsc::channel();
-        thread::spawn(move || write_requests(stdin, queue));
-        let reader = (Arc::clone(&asked), Arc::clone(&available), Arc::clone(&on_event));
-        thread::spawn(move || read_answers(stdout, &reader.0, &reader.1, &*reader.2));
+        let helper = helper.to_path_buf();
+        let runner = (Arc::clone(&process), Arc::clone(&asked), Arc::clone(&available), Arc::clone(&on_event));
+        thread::spawn(move || {
+            let (process, asked, available, on_event) = runner;
+            run_helper(&helper, &process, queue, &asked, &available, &*on_event);
+        });
         let watched = Arc::downgrade(&asked);
         thread::spawn(move || watch_answers(&watched, timeout, &*on_event));
-        Ok(Self {
-            child: Mutex::new(child),
+        Self {
+            process,
             requests: Mutex::new(requests),
             asked,
             available,
-        })
+        }
     }
 
     pub fn is_available(&self) -> bool {
@@ -141,9 +142,59 @@ impl Reviewer {
 
 impl Drop for Reviewer {
     fn drop(&mut self) {
-        let mut child = self.child.lock().expect("child lock");
-        let _ = child.kill();
-        let _ = child.wait();
+        let process = std::mem::replace(&mut *self.process.lock().expect("process lock"), Process::Stopped);
+        if let Process::Running(mut child) = process {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// 補助プロセスを起動し、終わるまで答えを読む。`Reviewer` のスレッドで呼ぶ。
+fn run_helper(
+    helper: &Path,
+    process: &Mutex<Process>,
+    queue: Receiver<(u64, String)>,
+    asked: &Mutex<Option<Asked>>,
+    available: &AtomicBool,
+    on_event: &dyn Fn(Event),
+) {
+    let spawned = Command::new(helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            fail_unanswered(asked, on_event);
+            return on_event(Event::Unavailable(format!("the helper could not be started: {error}")));
+        }
+    };
+    let stdin = child.stdin.take().expect("stdin is piped");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    {
+        let mut process = process.lock().expect("process lock");
+        // 起動している間に `Reviewer` が破棄された。
+        if matches!(*process, Process::Stopped) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        *process = Process::Running(child);
+    }
+    thread::spawn(move || write_requests(stdin, queue));
+    read_answers(stdout, asked, available, on_event);
+}
+
+/// 答えを待っている依頼を、答えられなかったと知らせる。補助プロセスが答えられなくなった時に呼ぶ。
+fn fail_unanswered(asked: &Mutex<Option<Asked>>, on_event: &dyn Fn(Event)) {
+    let unanswered = asked.lock().expect("asked lock").as_mut().filter(|asked| asked.waiting).map(|asked| {
+        asked.waiting = false;
+        asked.id
+    });
+    if let Some(id) = unanswered {
+        on_event(Event::Failed { id });
     }
 }
 
@@ -188,13 +239,7 @@ fn read_answers(stdout: impl BufRead, asked: &Mutex<Option<Asked>>, available: &
     }
     // 行が尽きたのは、補助プロセスが終わったから。待っている依頼は、期限を待たずに失敗にする。
     available.store(false, Ordering::Relaxed);
-    let unanswered = asked.lock().expect("asked lock").as_mut().filter(|asked| asked.waiting).map(|asked| {
-        asked.waiting = false;
-        asked.id
-    });
-    if let Some(id) = unanswered {
-        on_event(Event::Failed { id });
-    }
+    fail_unanswered(asked, on_event);
     on_event(Event::Unavailable("the helper stopped".to_string()));
 }
 
@@ -267,8 +312,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let reviewer = Reviewer::start(&helper(name, script), move |event| {
             let _ = sender.send(event);
-        })
-        .expect("starts");
+        });
         (reviewer, receiver)
     }
 
@@ -308,8 +352,7 @@ read line"#;
         let (sender, receiver) = mpsc::channel();
         let reviewer = Reviewer::start(Path::new(&helper), move |event| {
             let _ = sender.send(event);
-        })
-        .expect("the helper starts");
+        });
 
         // Act
         reviewer.request(1, "I has a pen and two book");
@@ -358,8 +401,7 @@ read line"#;
         let timeout = Duration::from_secs(60);
         let reviewer = Reviewer::start_with_timeout(&helper("quits", script), timeout, move |event| {
             let _ = sender.send(event);
-        })
-        .expect("starts");
+        });
 
         // Act
         reviewer.request(5, "I has a pen");
@@ -377,8 +419,7 @@ read line"#;
         let timeout = Duration::from_millis(200);
         let reviewer = Reviewer::start_with_timeout(&helper("silent", script), timeout, move |event| {
             let _ = sender.send(event);
-        })
-        .expect("starts");
+        });
 
         // Act
         reviewer.request(3, "I has a pen");
@@ -401,8 +442,7 @@ sleep 30"#;
         let timeout = Duration::from_secs(1);
         let reviewer = Reviewer::start_with_timeout(&helper("answered", script), timeout, move |event| {
             let _ = sender.send(event);
-        })
-        .expect("starts");
+        });
 
         // Act
         reviewer.request(4, "I has a pen");
@@ -459,9 +499,22 @@ sleep 30"#;
     }
 
     #[test]
-    fn a_missing_helper_is_an_error() {
-        let result = Reviewer::start(Path::new("/nonexistent/kayoiji-english-check"), |_| {});
-        assert!(result.is_err());
+    fn a_missing_helper_is_reported_as_unavailable() {
+        // Arrange
+        let (sender, events) = mpsc::channel();
+
+        // Act
+        let reviewer = Reviewer::start(Path::new("/nonexistent/kayoiji-english-check"), move |event| {
+            let _ = sender.send(event);
+        });
+
+        // Assert
+        let event = events.recv_timeout(WAIT).expect("a report");
+        assert!(
+            matches!(&event, Event::Unavailable(reason) if reason.starts_with("the helper could not be started")),
+            "{event:?}"
+        );
+        assert!(!reviewer.is_available());
     }
 
     #[test]

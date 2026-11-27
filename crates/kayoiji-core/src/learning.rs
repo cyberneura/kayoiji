@@ -195,11 +195,11 @@ impl Learning {
         std::mem::take(&mut self.outside_changes)
     }
 
-    /// 変更を記録に適用し、変わったら保存する。
+    /// 変更を記録に適用して保存する。手元の記録で変わらなくても積む。ほかのプロセスが先に別の表記を
+    /// 選んで保存していれば、ファイルの記録では変わる。
     fn record(&mut self, change: Change) -> io::Result<()> {
-        if self.apply(&change) {
-            self.pending.push(change);
-        }
+        self.apply(&change);
+        self.pending.push(change);
         self.save()
     }
 
@@ -289,19 +289,24 @@ impl Learning {
             .write(true)
             .open(path.with_extension("json.lock"))?;
         lock.lock()?;
-        let mut merged = match fs::read_to_string(&path) {
-            // 読めない内容に重ねることはできないので、このプロセスの記録で置き換える。
-            Ok(text) => serde_json::from_str::<Learning>(&text).unwrap_or_else(|_| self.clone()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Learning::default(),
+        let (mut merged, mut changed) = match fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Learning>(&text) {
+                Ok(saved) => (saved, false),
+                // 読めない内容に重ねることはできないので、このプロセスの記録で置き換える。
+                Err(_) => (self.clone(), true),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (Learning::default(), false),
             Err(error) => return Err(error),
         };
         for change in &self.pending {
-            merged.apply(change);
+            changed |= merged.apply(change);
         }
-        // 書き込みの途中で終了しても、元のファイルが壊れないようにする。
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(&merged).expect("learning serializes"))?;
-        fs::rename(&temporary, &path)?;
+        if changed {
+            // 書き込みの途中で終了しても、元のファイルが壊れないようにする。
+            let temporary = path.with_extension("json.tmp");
+            fs::write(&temporary, serde_json::to_vec_pretty(&merged).expect("learning serializes"))?;
+            fs::rename(&temporary, &path)?;
+        }
         self.outside_changes |= merged.phrases != self.phrases
             || merged.english_words != self.english_words
             || merged.flow_english_words != self.flow_english_words
@@ -553,6 +558,22 @@ mod tests {
         first.record_conversion("はれ", "晴れ").expect("saved");
         assert!(first.take_outside_changes());
         assert!(!first.take_outside_changes());
+    }
+
+    #[test]
+    fn choosing_again_what_this_process_already_has_first_still_wins_over_another_process() {
+        // Arrange: 両方のプロセスが「飴」を先頭に持っていて、もう一方が「雨」を選んで保存した
+        let path = temporary_file("choose-again");
+        Learning::load(&path).expect("empty").record_conversion("あめ", "飴").expect("saved");
+        let mut first = Learning::load(&path).expect("loads");
+        Learning::load(&path).expect("loads").record_conversion("あめ", "雨").expect("saved");
+
+        // Act: 手元では先頭のままの「飴」を、選び直す
+        first.record_conversion("あめ", "飴").expect("saved");
+
+        // Assert
+        assert_eq!(Learning::load(&path).expect("loads").conversions("あめ"), ["飴", "雨"]);
+        assert_eq!(first.conversions("あめ"), ["飴", "雨"]);
     }
 
     #[test]

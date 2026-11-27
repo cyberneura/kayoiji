@@ -127,6 +127,30 @@ fn base_key(text: &str) -> String {
         .collect()
 }
 
+/// 1 つの絵文字の符号位置の数の上限。家族や旗のタグの並びでも 10 程度。
+const MAX_EMOJI_CHARS: usize = 16;
+
+/// 絵文字として受け入れる文字列かどうか。データは版を固定せずに取得するので、取得元が壊れたり
+/// 書き換えられたりしても、制御文字や英文が候補として入力先に確定されないようにする。
+/// ASCII は、キーキャップ (`#️⃣` `1️⃣`) の先頭の数字と `#` `*` だけを認める。
+fn is_emoji_text(text: &str) -> bool {
+    let count = text.chars().count();
+    (1..=MAX_EMOJI_CHARS).contains(&count)
+        && text.chars().enumerate().all(|(index, c)| {
+            if c.is_ascii() {
+                return index == 0 && (c.is_ascii_digit() || c == '#' || c == '*') && count > 1;
+            }
+            !c.is_control() && !c.is_whitespace() && !is_hidden_format(c)
+        })
+}
+
+/// 表示されずに文字の向きや区切りを変える文字。ZWJ (U+200D) は絵文字の並びに使うので含めない。
+fn is_hidden_format(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200B}' | '\u{200C}' | '\u{200E}' | '\u{200F}' | '\u{FEFF}')
+        || ('\u{202A}'..='\u{202E}').contains(&c)
+        || ('\u{2060}'..='\u{2069}').contains(&c)
+}
+
 /// 漢字を含むキーワード。読みでは引けないので、ビルドの時に読みを足す。
 fn has_kanji(keyword: &str) -> bool {
     keyword.chars().any(|c| ('\u{3400}'..='\u{9FFF}').contains(&c) || c == '々')
@@ -180,7 +204,11 @@ impl Source {
             let at = catalog.groups.len();
             for subgroup in &raw.subgroups {
                 let mut previous = None;
-                for emoji in subgroup.emojis.iter().filter(|emoji| emoji.status == "fully-qualified") {
+                let qualified = subgroup
+                    .emojis
+                    .iter()
+                    .filter(|emoji| emoji.status == "fully-qualified" && is_emoji_text(&emoji.text));
+                for emoji in qualified {
                     let key = base_key(&emoji.text);
                     if !emoji.text.chars().any(|c| SKIN_TONES.contains(&c)) {
                         bases.insert(key, (at, group.emoji.len()));
@@ -343,6 +371,42 @@ pub(crate) mod tests {
         assert_eq!(hands[3].variants, ["👍🏻", "👍🏿"]);
         // 肌の色を 2 つ持つ握手は、肌の色を除いても 🤝 にならないが、🤝 の下に並べる。
         assert_eq!(hands[4].variants, ["🤝🏻", "🫱🏻‍🫲🏿"]);
+    }
+
+    #[test]
+    fn only_emoji_like_text_is_accepted_from_the_data() {
+        assert!(is_emoji_text("🐱"));
+        assert!(is_emoji_text("🫱🏻‍🫲🏿"));
+        assert!(is_emoji_text("#️⃣"));
+        assert!(is_emoji_text("🏴󠁧󠁢󠁥󠁮󠁧󠁿"));
+        assert!(!is_emoji_text("cat"));
+        assert!(!is_emoji_text("#"));
+        assert!(!is_emoji_text("🐱\n"));
+        assert!(!is_emoji_text("🐱 🐈"));
+        assert!(!is_emoji_text("\u{202E}🐱"));
+        assert!(!is_emoji_text("🐱\u{200B}"));
+        assert!(!is_emoji_text(""));
+        assert!(!is_emoji_text(&"🐱".repeat(MAX_EMOJI_CHARS + 1)));
+    }
+
+    #[test]
+    fn text_that_is_not_an_emoji_is_dropped_from_the_catalog() {
+        // Arrange: 取得元が書き換えられて、英文や改行を含む値が入った一覧
+        let catalog = r#"[{"groupTitleJa": "動物", "subgroups": [{"emojis": [
+            {"status": "fully-qualified", "emojiChar": "🐱", "descriptionJa": "猫の顔"},
+            {"status": "fully-qualified", "emojiChar": "rm -rf ~", "descriptionJa": "悪い値"},
+            {"status": "fully-qualified", "emojiChar": "🐈\n", "descriptionJa": "悪い値"}
+        ]}]}]"#;
+        let index = r#"{"ねこ": ["🐱", "rm -rf ~", "🐈\n"]}"#;
+
+        // Act
+        let source = Source::parse(catalog, index).expect("data");
+        let (catalog, dictionary) = source.build(&HashMap::new());
+        let emoji = Emoji::new(serde_json::from_str(&catalog).expect("catalog"), Dictionary::from_bytes(dictionary).expect("index"));
+
+        // Assert
+        assert_eq!(emoji.groups()[0].emoji.len(), 1);
+        assert_eq!(emoji.lookup("ねこ"), ["🐱"]);
     }
 
     #[test]

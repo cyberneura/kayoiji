@@ -1,6 +1,6 @@
 {
   "name": "kayoiji",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Modeless Japanese/English input method for macOS",
   "type": "module",
   "private": true,

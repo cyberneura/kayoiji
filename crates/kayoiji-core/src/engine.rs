@@ -58,9 +58,8 @@ pub struct EngineConfig {
     /// 「かな」キーで入る入力モードを、自動切り替え (`InputMode::Auto`) にする。
     /// false なら日本語入力 (`InputMode::Japanese`)。
     pub auto_switch: bool,
-    /// 日本語入力 (`InputMode::Japanese`) で英語を打ち始めたら、直接入力に切り替える。
-    /// 英語を打ち始めたとみなすのは、大文字の英字と、ローマ字の規則に無い並び ("st", "pl")。
-    /// "thi" (てぃ) のように規則にある並びと、その途中 ("th") は、日本語のままにする。
+    /// 日本語入力 (`InputMode::Japanese`) で、何も入力していない時に英語を打ち始めたら、直接入力に切り替える。
+    /// 英語を打ち始めたとみなすのは、大文字の英字、英語が続く記号、スペース。入力中は切り替えない。
     pub leave_japanese_for_english: bool,
     /// 「かな」を続けて 2 度押すと、英文チェック (`InputMode::English`) に入る。英文チェックの綴りの検査と
     /// 訂正文は OS の機能 (macOS のスペルチェッカーと言語モデル) で作るので、それが無い OS では切る。
@@ -884,60 +883,29 @@ impl Engine {
         }
     }
 
-    /// 日本語入力で英語を打ち始めたら、入力中の文字列を確定して直接入力にする (設定で有効な時)。
-    /// 英語を打ち始めていなければ `None`。
-    ///
-    /// 「英数」を押した時と同じく、かなは表示のとおりに確定する。違うのは、打った文字の扱い。
-    /// 大文字と記号は、直接入力にした後の打鍵として入力先に通す。ローマ字として読めない並びは、
-    /// 読める所までをかなで、残りを打ったままの英字で確定する。
-    /// 何も入力していない時のスペースも、直接入力にしてから入力先に通す。
-    /// 日本語の文の中でスペースを打つのは、たいてい英語の前だから。
+    /// 日本語入力で、何も入力していない時に英語を打ち始めたら、直接入力にする (設定で有効な時)。
+    /// 英語を打ち始めていなければ `None`。打った文字は、直接入力にした後の打鍵として入力先に通す。
+    /// スペースも抜ける。日本語の文の中でスペースを打つのは、たいてい英語の前だから。
     fn leave_japanese_for_english(&mut self, key: Key) -> Option<Output> {
         if self.input_mode != InputMode::Japanese || !self.config.leave_japanese_for_english {
             return None;
         }
+        // 抜けるのは、何も入力していない時だけ。何文字か入力している途中の大文字や英語らしい並びは、
+        // 打ち間違いとみなして日本語入力を続ける。
+        if !self.preedit().is_empty() {
+            return None;
+        }
         let c = match key {
             Key::Char(c) => c,
-            // 入力中のスペースは変換に使う。
-            Key::Space if self.preedit().is_empty() => ' ',
+            Key::Space => ' ',
             _ => return None,
         };
-        // 「絵文字を探す」を選んでいる時の文字は、絵文字モードの検索語の 1 文字目にする。
-        if let State::Converting(converting) = &self.state {
-            if converting.segments.iter().any(ConvertingSegment::opens_emoji_search) {
-                return None;
-            }
+        if !(c == ' ' || c.is_ascii_uppercase() || leads_english(c)) {
+            return None;
         }
-        let completes_rule = match &self.state {
-            State::Composing { raw, .. } => completes_rule(raw, c),
-            _ => false,
-        };
-        let step = if c == ' ' || c.is_ascii_uppercase() || (leads_english(c) && !completes_rule) {
-            let commit = match std::mem::replace(&mut self.state, State::Direct(Direct::at_boundary())) {
-                State::Converting(converting) => self.commit(converting).commit,
-                state => {
-                    self.state = state;
-                    self.preedit()
-                }
-            };
-            Step::commit_and_pass(commit)
-        } else {
-            let State::Composing { raw, .. } = &self.state else {
-                return None;
-            };
-            let mut typed = raw.clone();
-            typed.push(c);
-            // 1 文字だけでは決めない。"q" や "x" のように、単独では読めない打鍵で始まるかながある。
-            let word = typed.rsplit(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default();
-            if !c.is_ascii_lowercase() || word.len() < 2 || !RomajiTable::global().parse(word).has_unreadable() {
-                return None;
-            }
-            let (kana, letters) = RomajiTable::global().parse(&typed).split_at_unreadable();
-            Step::commit(kana + &letters)
-        };
         self.reset();
         self.input_mode = InputMode::Direct;
-        Some(self.output(step))
+        Some(self.output(Step::commit_and_pass(String::new())))
     }
 
     /// 日本語入力で、入力中の文字列が無い時の打鍵。文字のキーは、記号も含めて日本語の入力を始める。
@@ -1738,18 +1706,6 @@ fn select_katakana(segment: &mut ConvertingSegment) {
 /// ローマ字の一部として打つ "'"、日本語の文末に付ける "!" と "?" は含めない。
 fn leads_english(c: char) -> bool {
     c.is_ascii_punctuation() && !matches!(c, ',' | '.' | '[' | ']' | '-' | '~' | '\'' | '!' | '?')
-}
-
-/// 入力中の打鍵 `raw` に `c` を足すと、ローマ字の規則の一部になるかどうか ("z" + "/" で「・」)。
-fn completes_rule(raw: &str, c: char) -> bool {
-    let mut typed = raw.to_string();
-    typed.push(c);
-    let parsed = RomajiTable::global().parse(&typed);
-    parsed.pending.ends_with(c)
-        || parsed
-            .segments
-            .last()
-            .is_some_and(|segment| segment.converted && segment.raw.ends_with(c))
 }
 
 fn japanese_punctuation(c: char) -> char {
@@ -3355,22 +3311,6 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn an_uppercase_letter_leaves_japanese_input() {
-        // Arrange
-        let mut simulator = leaving_simulator();
-        simulator.run("kyouha");
-
-        // Act
-        let output = simulator.engine.handle(Key::Char('I'), 10_000);
-
-        // Assert
-        // かなは表示のとおりに確定し、大文字は直接入力の打鍵として入力先に通す。
-        assert_eq!(output.commit, "きょうは");
-        assert!(!output.consumed);
-        assert_eq!(output.preedit, "");
-        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
-    }
 
     #[test]
     fn an_uppercase_first_letter_leaves_japanese_input() {
@@ -3388,54 +3328,53 @@ mod tests {
         assert!(!space.consumed);
     }
 
-    #[test]
-    fn an_uppercase_letter_while_converting_commits_the_conversion_and_leaves() {
-        // Arrange
-        let mut simulator = leaving_simulator();
-        simulator.run("kyouha ");
 
-        // Act
-        let output = simulator.engine.handle(Key::Char('T'), 10_000);
 
-        // Assert
-        assert_eq!(output.commit, "今日は");
-        assert!(!output.consumed);
-        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
-    }
 
     #[test]
-    fn letters_that_are_not_romaji_leave_japanese_input() {
-        // Arrange
-        let mut simulator = leaving_simulator();
-
-        // Act: "pl" で始まるかなは無い
-        simulator.run("kyouhapl");
-
-        // Assert
-        // 読める所まではかな、残りは打ったままの英字で確定する。
-        assert_eq!(simulator.text, "きょうはpl");
-        assert_eq!(simulator.engine.preedit(), "");
-        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
-    }
-
-    #[test]
-    fn unreadable_letters_before_a_separator_keep_the_following_kana() {
-        for (typed, expected) in [
-            ("k,kanast", "k、かなst"),
-            ("desuk.sorehast", "ですk。それはst"),
-            ("ufok?ttd", "うふぉk?っtd"),
-            ("xt'ikanast", "xてぃかなst"),
-        ] {
+    fn english_like_keys_while_typing_keep_japanese_input() {
+        // 何文字か入力している途中の大文字、ローマ字として読めない並び、英語が続く記号は、打ち間違いとみなす。
+        // JIS キーボードの ¥ キーは、2 バイトの文字として届く。
+        for typed in ["kyouhaI", "kyouhapl", "korehast", "kyouha@", "3gatsu?korehast", "k,kanast", "¥st"] {
             // Arrange
             let mut simulator = leaving_simulator();
 
             // Act
             simulator.run(typed);
 
-            // Assert
-            assert_eq!(simulator.text, expected, "{typed}");
-            assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+            // Assert: 日本語入力のまま、何も確定しない。
+            assert_eq!(simulator.engine.input_mode(), InputMode::Japanese, "{typed}");
+            assert_eq!(simulator.committed, "", "{typed}");
+            assert!(!simulator.engine.preedit().is_empty(), "{typed}");
         }
+    }
+
+    #[test]
+    fn an_uppercase_letter_while_converting_keeps_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+        simulator.run("kyouha ");
+
+        // Act
+        simulator.run("T");
+
+        // Assert: 変換を確定して、大文字から日本語の入力を続ける。
+        assert_eq!(simulator.committed, "今日は");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    #[test]
+    fn an_uppercase_letter_after_committing_leaves_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+        simulator.run("kyouha\n");
+
+        // Act
+        simulator.run("It");
+
+        // Assert
+        assert_eq!(simulator.text, "きょうはIt");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
     }
 
     #[test]
@@ -3464,34 +3403,7 @@ mod tests {
         assert_eq!(simulator.engine.preedit(), "てぃでぃとぅくぁ←うぃ");
     }
 
-    #[test]
-    fn letters_outside_the_romaji_rules_leave_japanese_input() {
-        // Arrange
-        let mut simulator = leaving_simulator();
 
-        // Act: "st" で始まるかなは無い
-        simulator.run("korehast");
-
-        // Assert
-        assert_eq!(simulator.text, "これはst");
-        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
-    }
-
-    #[test]
-    fn a_symbol_before_english_leaves_japanese_input() {
-        // Arrange
-        let mut simulator = leaving_simulator();
-        simulator.run("kyouha");
-
-        // Act
-        let output = simulator.engine.handle(Key::Char('@'), 10_000);
-
-        // Assert
-        // かなは表示のとおりに確定し、記号は直接入力の打鍵として入力先に通す。
-        assert_eq!(output.commit, "きょうは");
-        assert!(!output.consumed);
-        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
-    }
 
     #[test]
     fn a_symbol_with_nothing_typed_leaves_japanese_input() {
@@ -3532,31 +3444,7 @@ mod tests {
         assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
     }
 
-    #[test]
-    fn kana_after_digits_and_symbols_stays_kana_when_leaving() {
-        // Arrange
-        let mut simulator = leaving_simulator();
 
-        // Act
-        simulator.run("3gatsu?korehast");
-
-        // Assert
-        assert_eq!(simulator.text, "3がつ?これはst");
-        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
-    }
-
-    #[test]
-    fn letters_after_a_wide_character_are_read_without_breaking() {
-        // Arrange: JIS キーボードの ¥ キーは、2 バイトの文字として届く
-        let mut simulator = leaving_simulator();
-
-        // Act
-        simulator.run("¥st");
-
-        // Assert
-        assert_eq!(simulator.text, "¥st");
-        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
-    }
 
     #[test]
     fn a_space_with_nothing_typed_leaves_japanese_input() {

@@ -16,7 +16,7 @@ pub struct Settings {
     pub sequence_timeout_ms: u64,
     /// 英語か日本語かを判定しながら入力する。false なら、「かな」「英数」キーで切り替える。
     pub auto_switch: bool,
-    /// 日本語入力で英語を打ち始めたら (大文字、ローマ字として読めない並び)、直接入力に切り替える。
+    /// 日本語入力で、何も入力していない時に英語を打ち始めたら (大文字、英語が続く記号、スペース)、直接入力に切り替える。
     pub leave_japanese_for_english: bool,
 }
 

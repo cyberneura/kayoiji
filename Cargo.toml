@@ -5,6 +5,7 @@ members = ["crates/kayoiji-core", "crates/kayoiji-check", "crates/kayoiji-cli", 
 [workspace.package]
 version = "0.6.1"
 edition = "2021"
+license = "MIT"
 publish = false
 
 [workspace.dependencies]

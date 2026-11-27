@@ -3,6 +3,7 @@ name = "kayoiji-check"
 description = "英文チェックの部品。綴りの検査と、言語モデルの補助プロセスの呼び出し"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

@@ -3,6 +3,7 @@ name = "kayoiji-pad"
 description = "A text area for trying and tuning the Kayoiji engine"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

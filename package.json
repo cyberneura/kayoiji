@@ -17,7 +17,7 @@
     "pad": "cd pad && tauri dev",
     "pad:build": "cd pad && tauri build"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "dependencies": {
     "@tailwindcss/vite": "^4.1.11",
     "@tauri-apps/api": "^2"

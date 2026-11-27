@@ -62,6 +62,13 @@ jobs:
               }
             }
             Write-Output "$dll exports the COM entry points"
+            # C のランタイムは静的にリンクする (.cargo/config.toml)。再頒布可能パッケージの無い Windows でも読み込めるように。
+            $dependents = & $dumpbin.FullName /dependents $dll | Out-String
+            if ($dependents -match '(?i)vcruntime|msvcp|api-ms-win-crt') {
+              Write-Error "$dll depends on the Visual C++ runtime:`n$dependents"
+              exit 1
+            }
+            Write-Output "$dll does not depend on the Visual C++ runtime"
           }
 
       # インストーラーも PR で作り、成果物として残す。Windows の機械で入れて試せるようにする。

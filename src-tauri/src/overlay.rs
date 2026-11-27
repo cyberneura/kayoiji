@@ -57,7 +57,26 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .build()?;
     // クリックを入力先のウインドウへ通す。候補は番号キーで選ぶ。
     window.set_ignore_cursor_events(true)?;
+    #[cfg(target_os = "macos")]
+    raise_above_apps(&window)?;
     Ok(window)
+}
+
+/// ポップアップメニューと同じ高さ (`NSPopUpMenuWindowLevel`)。`always_on_top` の高さ
+/// (`NSFloatingWindowLevel` = 3) では、ランチャーのようにメニューバーより上に出るウインドウで入力すると、
+/// 候補がその後ろに隠れる。
+#[cfg(target_os = "macos")]
+const LEVEL: isize = 101;
+
+#[cfg(target_os = "macos")]
+fn raise_above_apps(window: &WebviewWindow) -> tauri::Result<()> {
+    let ns_window = window.ns_window()?.cast::<objc2::runtime::AnyObject>();
+    // SAFETY: Tauri が作った生きている NSWindow で、ウインドウの作成と同じメインスレッドから呼ばれる。
+    // `setLevel:` は NSInteger を 1 つ取り、何も返さない。
+    unsafe {
+        let _: () = objc2::msg_send![ns_window, setLevel: LEVEL];
+    }
+    Ok(())
 }
 
 /// 表示内容を候補ウインドウへ反映する。`anchor` は未確定文字列の先頭の位置。

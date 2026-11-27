@@ -1,5 +1,8 @@
-/** `checking` は、英文チェックで英文を受け取っている状態。`View.reading` がその英文。 */
-export type Mode = 'direct' | 'composing' | 'converting' | 'checking';
+/**
+ * `checking` は、英文チェックで英文を受け取っている状態。`View.reading` がその英文。
+ * `emoji` は絵文字モード。`View.candidates` が一覧の絵文字、`View.emoji` がそのほかの内容。
+ */
+export type Mode = 'direct' | 'composing' | 'converting' | 'checking' | 'emoji';
 
 /**
  * `japanese` はすべての打鍵を日本語として入力する。`auto` は英語か日本語かを判定しながら入力する。
@@ -54,6 +57,23 @@ export interface View {
   selected: number | null;
   page: number;
   page_count: number;
+  emoji: EmojiView | null;
+}
+
+/** 絵文字モードの内容。Rust 側の `kayoiji_core::emoji_search::EmojiView` と同じ形。 */
+export interface EmojiView {
+  /** 打っている検索語 (かな)。 */
+  query: string;
+  groups: string[];
+  /** 一覧を見ているグループ。検索している間は null。 */
+  group: number | null;
+  /** 一覧の 1 行に並べる数。 */
+  columns: number;
+  /** 選んでいる絵文字の名前。 */
+  name: string;
+  /** 肌の色の違いを出している時の、基本の絵文字と色違い。 */
+  variants: string[];
+  variant: number | null;
 }
 
 export interface Settings {

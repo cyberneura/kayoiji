@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Kayoiji",
   "mainBinaryName": "kayoiji",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "identifier": "com.cyberneura.inputmethod.Kayoiji",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -39,7 +39,9 @@
       "lproj/en.lproj/InfoPlist.strings": "en.lproj/InfoPlist.strings",
       "lproj/ja.lproj/InfoPlist.strings": "ja.lproj/InfoPlist.strings",
       "icons/menu-icon-japanese.pdf": "menu-icon-japanese.pdf",
-      "../data/build/symbols.dict": "data/symbols.dict"
+      "../data/build/symbols.dict": "data/symbols.dict",
+      "../data/build/emoji.dict": "data/emoji.dict",
+      "../data/build/emoji.json": "data/emoji.json"
     }
   }
 }

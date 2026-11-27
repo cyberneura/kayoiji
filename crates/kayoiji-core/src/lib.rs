@@ -4,6 +4,8 @@ pub mod converter;
 pub mod dates;
 pub mod detector;
 pub mod dict;
+pub mod emoji;
+pub mod emoji_search;
 pub mod engine;
 pub mod english;
 pub mod kana;

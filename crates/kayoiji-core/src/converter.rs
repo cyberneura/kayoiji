@@ -12,6 +12,7 @@ use chrono::{Local, NaiveDate};
 
 use crate::dates::date_candidates;
 use crate::dict::Dictionary;
+use crate::emoji::Emoji;
 use crate::kana::{is_kana, to_katakana};
 
 /// 文頭・文末の文脈 ID (Mozc の `BOS/EOS`)。
@@ -32,6 +33,8 @@ const LEADING_CONVERSIONS: usize = 3;
 /// 記号や日付の候補のうち、上位に置く数。残りは一覧の末尾に置く。
 const LEADING_SUPPLEMENTS: usize = 6;
 const WORD_CANDIDATES: usize = 60;
+/// 絵文字を引くのに使う、候補の先頭からの数。読みに加えて、これらの表記 (「猫」など) でも引く。
+const EMOJI_KEYWORD_CANDIDATES: usize = 5;
 /// 利用者が覚えさせた語 (`Converter::learn_phrase`) のコストの上限。辞書のよく使われる語と同じ程度。
 /// 語のコストは、同じ読みの辞書だけの変換に勝つ値にする (`PHRASE_MARGIN`)。その値が大きい時は、
 /// 文の途中でも語が使われるように、この上限まで下げる。
@@ -383,6 +386,7 @@ pub struct Converter {
     dictionary: Arc<Dictionary>,
     /// 読みから記号や顔文字を引く辞書。
     symbols: Option<Arc<Dictionary>>,
+    emoji: Option<Arc<Emoji>>,
     phrases: Phrases,
     today: Box<dyn Fn() -> NaiveDate + Send + Sync>,
 }
@@ -392,6 +396,7 @@ impl Converter {
         Self {
             dictionary,
             symbols: None,
+            emoji: None,
             phrases: Phrases::default(),
             today: Box::new(|| Local::now().date_naive()),
         }
@@ -491,6 +496,15 @@ impl Converter {
         self
     }
 
+    pub fn with_emoji(mut self, emoji: Arc<Emoji>) -> Self {
+        self.emoji = Some(emoji);
+        self
+    }
+
+    pub fn emoji(&self) -> Option<&Arc<Emoji>> {
+        self.emoji.as_ref()
+    }
+
     /// 日付の候補の基準になる日を差し替える。
     pub fn with_today(mut self, today: impl Fn() -> NaiveDate + Send + Sync + 'static) -> Self {
         self.today = Box::new(today);
@@ -550,7 +564,7 @@ impl Converter {
     /// 1 つの文節の候補を作る。`preferred` は、文全体の変換でこの文節に当たった表記。
     ///
     /// 並びは、`preferred`、読みを変換した上位の結果、記号や日付の上位、変換の残り、
-    /// 読みに一致する単語、ひらがな、カタカナ、記号の残りの順。
+    /// 読みに一致する単語、ひらがな、カタカナ、絵文字、記号の残りの順。
     pub fn segment(&self, reading: &str, preferred: Option<&str>) -> Segment {
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -583,6 +597,16 @@ impl Converter {
         }
         push(&mut candidates, reading.to_string(), true);
         push(&mut candidates, to_katakana(reading), true);
+        if let Some(emoji) = &self.emoji {
+            let keywords: Vec<String> = std::iter::once(reading.to_string())
+                .chain(candidates.iter().take(EMOJI_KEYWORD_CANDIDATES).map(|candidate| candidate.surface.clone()))
+                .collect();
+            for keyword in keywords {
+                for text in emoji.lookup(&keyword) {
+                    push(&mut candidates, text.to_string(), true);
+                }
+            }
+        }
         for candidate in &supplements[leading_supplements..] {
             push(&mut candidates, candidate.surface.clone(), candidate.learnable);
         }
@@ -668,6 +692,9 @@ pub(crate) mod tests {
             ("はめ", 1, 1, 3000, "羽目"),
             ("がわ", 2, 2, 3000, "側"),
             ("これあめ", 1, 1, 9500, "此雨"),
+            ("ねこ", 1, 1, 4100, "猫"),
+            ("えがお", 1, 1, 4400, "笑顔"),
+            ("えもじ", 1, 1, 4600, "絵文字"),
         ] {
             builder.add(reading, lid, rid, cost, surface);
         }
@@ -696,6 +723,7 @@ pub(crate) mod tests {
     pub(crate) fn sample_converter() -> Converter {
         Converter::new(sample_dictionary())
             .with_symbols(sample_symbols())
+            .with_emoji(Arc::new(crate::emoji::tests::sample_emoji()))
             .with_today(|| NaiveDate::from_ymd_opt(2026, 11, 25).expect("valid date"))
     }
 
@@ -975,6 +1003,20 @@ pub(crate) mod tests {
         // かなではない読みも、記号の読みとして引ける。
         assert_eq!(&surfaces(&converter.segment("。", None))[..3], ["。", "…", "．"]);
         assert!(surfaces(&converter.segment("かお", None)).contains(&"(^o^)"));
+    }
+
+    #[test]
+    fn emoji_follow_the_words_and_kana() {
+        // Arrange
+        let converter = sample_converter();
+
+        // Act
+        let neko = converter.segment("ねこ", None);
+        let egao = converter.segment("えがお", None);
+
+        // Assert: 読みで引いた絵文字の後に、表記 (「猫」「笑顔」) で引いた絵文字が続く。
+        assert_eq!(surfaces(&neko), ["猫", "ねこ", "ネコ", "🐱", "🐈", "😺"]);
+        assert_eq!(surfaces(&egao), ["笑顔", "えがお", "エガオ", "☺️"]);
     }
 
     #[test]

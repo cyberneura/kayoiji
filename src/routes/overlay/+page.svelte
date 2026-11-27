@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { onMount, tick } from 'svelte';
+  import EmojiGrid from '$lib/EmojiGrid.svelte';
   import { suggestion, type Review, type Spelling, type View } from '$lib/types';
 
   /** 入力メソッドから届く、綴りの検査の結果。 */
@@ -19,7 +20,8 @@
     candidates: [],
     selected: null,
     page: 0,
-    page_count: 0
+    page_count: 0,
+    emoji: null
   });
   let panel = $state<HTMLElement>();
   let report = $state<SpellingReport | null>(null);
@@ -143,6 +145,8 @@
         <span>Esc 取消</span>
       </div>
     </dl>
+  {:else if view.mode === 'emoji'}
+    <EmojiGrid {view} />
   {:else if view.mode === 'composing'}
     <div class="flex items-center gap-2 px-2 py-1 text-xs text-gray-500 dark:text-gray-400">
       <span>Space 変換</span>

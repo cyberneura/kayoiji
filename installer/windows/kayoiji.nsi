@@ -23,6 +23,7 @@ Unicode true
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Kayoiji"
 !define REGSVR32_64 "$WINDIR\Sysnative\regsvr32.exe"
 !define REGSVR32_32 "$WINDIR\SysWOW64\regsvr32.exe"
+!define RUNONCE "Software\Microsoft\Windows\CurrentVersion\RunOnce"
 
 Name "Kayoiji ${VERSION}"
 OutFile "${OUTFILE}"
@@ -62,6 +63,10 @@ FunctionEnd
 
 Section "Install"
   ReadRegStr $1 HKLM "${REGKEY}" "InstalledDir"
+  ReadRegStr $3 HKLM "${REGKEY}" "InstalledVersion"
+  ; 前に入れ替えた時に、この版のフォルダーを次のログオンで消すように登録していたら取り消す
+  ; (入れ替えた後、ログオンし直す前に、前の版を入れ直した時)。
+  DeleteRegValue HKLM "${RUNONCE}" "KayoijiRemove${VERSION}"
   ${If} $1 != ""
     !insertmacro Unregister "$1"
   ${EndIf}
@@ -88,12 +93,15 @@ Section "Install"
 
   ; 前の版のフォルダーは、次にログオンする時に丸ごと消す。前の版を読み込んだアプリは、テキストサービスを
   ; 有効にし直すたびに隣の辞書を開くので、使われていないファイルだけを今消すと、そのアプリで打てなくなる。
+  ; 登録の名前は消すフォルダーの版にして、その版を入れ直した時に取り消せるようにする。
   ${If} $1 != ""
   ${AndIf} $1 != $2
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\RunOnce" "KayoijiRemove${VERSION}" '"$SYSDIR\cmd.exe" /c rmdir /s /q "$1"'
+  ${AndIf} $3 != ""
+    WriteRegStr HKLM "${RUNONCE}" "KayoijiRemove$3" '"$SYSDIR\cmd.exe" /c rmdir /s /q "$1"'
   ${EndIf}
 
   WriteRegStr HKLM "${REGKEY}" "InstalledDir" "$2"
+  WriteRegStr HKLM "${REGKEY}" "InstalledVersion" "${VERSION}"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "Kayoiji"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"

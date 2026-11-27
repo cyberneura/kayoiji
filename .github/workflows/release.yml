@@ -387,10 +387,78 @@ jobs:
           gh api -X POST "https://uploads.github.com/repos/${GH_REPO}/releases/${RELEASE_ID}/assets?name=${NAME}" \
             -H "Content-Type: application/zip" --input "$ZIP" --jq '.browser_download_url'
 
+  # Windows 版のインストーラー。署名はしない (flashcap と同じ)。Windows のテストもこのジョブの中で通す。
+  build-windows:
+    needs: [plan, test, draft]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc
+
+      - name: Cache Rust (cargo + target)
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Cache dictionary sources
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: data/raw
+          key: dictionary-sources-${{ hashFiles('scripts/fetch-data.sh') }}
+
+      - name: Run tests
+        run: cargo test --locked -p kayoiji-core -p kayoiji-windows
+
+      - name: Install NSIS
+        run: |
+          choco install nsis --version 3.11 -y --no-progress
+          echo "${env:ProgramFiles(x86)}\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build the installer
+        id: installer
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          output=$(bash scripts/build-windows-installer.sh | tail -n 1)
+          case "$output" in
+            "target/Kayoiji_${VERSION}_windows_setup.exe") ;;
+            *) echo "::error::expected the installer for ${VERSION}, got ${output}"; exit 1 ;;
+          esac
+          echo "installer=$output" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the installer to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+          INSTALLER: ${{ steps.installer.outputs.installer }}
+        run: |
+          NAME=$(basename "$INSTALLER")
+          export NAME
+          for id in $(gh api "repos/${GH_REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | select(.name == env.NAME) | .id'); do
+            gh api -X DELETE "repos/${GH_REPO}/releases/assets/${id}"
+            echo "Deleted the previous asset ${id} (${NAME})."
+          done
+          gh api -X POST "https://uploads.github.com/repos/${GH_REPO}/releases/${RELEASE_ID}/assets?name=${NAME}" \
+            -H "Content-Type: application/vnd.microsoft.portable-executable" --input "$INSTALLER" --jq '.browser_download_url'
+
   # ビルドと上げが成功した時だけ、下書きを公開する。失敗したら下書きのまま残る。
   # cyberneura/homebrew-tap は、1 時間ごとに最新のリリースを読みに来て Cask を更新する。
   publish:
-    needs: [plan, draft, build]
+    needs: [plan, draft, build, build-windows]
     if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5

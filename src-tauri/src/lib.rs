@@ -224,6 +224,47 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    /// 配布物に入るクレートの `Cargo.toml` (アプリと、そのワークスペース内の依存)。
+    const SHIPPED_MANIFESTS: [&str; 3] = ["Cargo.toml", "../crates/kayoiji-core/Cargo.toml", "../crates/kayoiji-check/Cargo.toml"];
+
+    #[test]
+    fn third_party_notices_list_every_direct_dependency() {
+        // Arrange
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let notices = std::fs::read_to_string(root.join("../THIRD-PARTY-NOTICES.txt")).expect("notices");
+        let workspace: toml::Table =
+            toml::from_str(&std::fs::read_to_string(root.join("../Cargo.toml")).expect("manifest")).expect("toml");
+        let members: Vec<&str> = workspace["workspace"]["dependencies"]
+            .as_table()
+            .expect("workspace dependencies")
+            .iter()
+            .filter(|(_, spec)| spec.get("path").is_some())
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        // Act
+        let mut missing = Vec::new();
+        for manifest in SHIPPED_MANIFESTS {
+            let manifest: toml::Table =
+                toml::from_str(&std::fs::read_to_string(root.join(manifest)).expect("manifest")).expect("toml");
+            let tables = std::iter::once(manifest.get("dependencies")).chain(
+                manifest
+                    .get("target")
+                    .and_then(|targets| targets.as_table())
+                    .into_iter()
+                    .flat_map(|targets| targets.values().map(|target| target.get("dependencies"))),
+            );
+            for name in tables.flatten().filter_map(|table| table.as_table()).flat_map(|table| table.keys()) {
+                if !members.contains(&name.as_str()) && !notices.contains(&format!("\n  {name} ")) {
+                    missing.push(name.clone());
+                }
+            }
+        }
+
+        // Assert: 足りなければ `pnpm notices` で作り直す。
+        assert!(missing.is_empty(), "not in THIRD-PARTY-NOTICES.txt: {missing:?}");
+    }
+
     #[test]
     fn the_build_time_is_embedded_as_seconds() {
         // 2026-01-01 00:00:00 UTC。ミリ秒や 0 が埋め込まれていれば、ここで分かる。

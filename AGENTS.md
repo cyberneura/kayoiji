@@ -86,6 +86,14 @@ pnpm pad                     # KayoijiPad を開発モードで起動する
   綴りの訂正候補を作る処理 (1 語あたり数十ミリ秒) も打鍵のたびには行わず、打鍵が止まってから行う (`Guesses::Lookup`)
 - 辞書の形式 (`dict.rs` の `MAGIC`) を変えたら、`pnpm data` で `data/build` を作り直す
 - 辞書の元データ (`data/raw`) とビルドした辞書 (`data/build`) はコミットしない
+- リリースは `.github/workflows/release.yml` が行う。main の版 (`Cargo.toml` の workspace、`package.json`、
+  `src-tauri/tauri.conf.json`、`pad/src-tauri/tauri.conf.json`。4 か所をそろえる) がまだリリースしていない版なら、
+  macOS 26 の runner で辞書と補助プロセスを作り、`Kayoiji.app` を Developer ID で署名・公証して zip を Release に添付する。
+  Homebrew の Cask (`cyberneura/homebrew-tap` の `Casks/kayoiji.rb`) は、tap の側が 1 時間ごとに最新のリリースを読んで更新する
+- 配布物に入る依存 (Rust のクレート、WebView に入る npm のパッケージ) を足したり上げたりしたら、`pnpm notices` で
+  `THIRD-PARTY-NOTICES.txt` を作り直してコミットする。直接の依存が載っていないと、`src-tauri` のテストが落ちる。
+  WebView に入る npm のパッケージを足した時は、`scripts/generate-third-party-notices.sh` の `BUNDLED_PACKAGES` にも足す。
+  辞書やデータの出典を変えたら `THIRD-PARTY-NOTICES.md` を直し、`pnpm notices` を実行する
 - 絵文字のデータは emoji-explorer (`https://emoji.ytyng.com/`) から取得する。ビルド (`kayoiji-core` の
   `emoji::Source`) で、肌の色の違いを基本の絵文字の下にまとめた一覧 (`emoji.json`) と、キーワードから
   基本の絵文字を引く辞書 (`emoji.dict`) を作る。索引には U+FE0F の無い形や一覧に無い記号が混ざるので、

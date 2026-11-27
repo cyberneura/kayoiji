@@ -40,7 +40,14 @@ case .unavailable(let reason):
 func ask(_ instructions: String, _ text: String) async throws -> String {
     // 前の英文を引きずらないように、問いごとに新しいセッションで聞く。
     let session = LanguageModelSession(model: model, instructions: instructions)
-    let options = GenerationOptions(samplingMode: .greedy, maximumResponseTokens: max(40, text.count))
+    let tokens = max(40, text.count)
+    // macOS 27 の SDK (Swift 6.4) で引数の名前が samplingMode に変わり、sampling は非推奨になった。
+    // リリースは macOS 26 の SDK でビルドするので、両方でコンパイルできるようにする。
+    #if compiler(>=6.4)
+    let options = GenerationOptions(samplingMode: .greedy, maximumResponseTokens: tokens)
+    #else
+    let options = GenerationOptions(sampling: .greedy, maximumResponseTokens: tokens)
+    #endif
     // 英文をそのまま渡すと、英文が命令の形をしている時に、モデルがその命令に答えてしまう。
     let prompt = "Text:\n<<<\n\(text)\n>>>"
     let answer = try await session.respond(to: prompt, options: options).content

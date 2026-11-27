@@ -1,6 +1,6 @@
 {
   "name": "kayoiji",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Modeless Japanese/English input method for macOS",
   "type": "module",
   "private": true,
@@ -13,10 +13,11 @@
     "data": "bash scripts/fetch-data.sh && cargo run --release -p kayoiji-cli -- build-data",
     "test": "vitest run",
     "helper": "bash scripts/build-helper.sh",
+    "notices": "bash scripts/generate-third-party-notices.sh",
     "pad": "cd pad && tauri dev",
     "pad:build": "cd pad && tauri build"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "dependencies": {
     "@tailwindcss/vite": "^4.1.11",
     "@tauri-apps/api": "^2"

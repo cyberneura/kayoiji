@@ -62,6 +62,7 @@
     // 前の英文の訂正案で今の英文を置き換える。
     spelling = null;
     review = null;
+    reviewError = '';
     reviewId += 1;
     const text = view.mode === 'checking' ? view.reading : '';
     if (!text.trim()) return;
@@ -73,15 +74,15 @@
     };
     // 打鍵のたびには、すでに調べた単語の訂正候補だけを付ける。新しい候補を作るのは時間がかかる。
     check(false).catch((cause) => console.error(cause));
-    reviewTimer = setTimeout(async () => {
-      try {
-        await invoke('pad_review', { id, text });
-        // 訂正候補は 1 回に数語ずつ作られる。英文が変わったらやめる。
-        while (id === reviewId && (await check(true)).pending);
-        reviewError = '';
-      } catch (cause) {
+    reviewTimer = setTimeout(() => {
+      invoke('pad_review', { id, text }).catch((cause) => {
         if (id === reviewId) reviewError = String(cause);
-      }
+      });
+      // 言語モデルが使えなくても、綴りの訂正候補は最後まで作る。
+      const completeSpelling = async () => {
+        while (id === reviewId && (await check(true)).pending);
+      };
+      completeSpelling().catch((cause) => console.error(cause));
     }, CHECK_DELAY_MS);
   }
 
@@ -275,10 +276,13 @@
     window.addEventListener('focus', refreshInputSource);
     const unlisten = [
       listen<Review>('english-review', (event) => {
-        if (event.payload.id === reviewId) review = event.payload;
+        if (event.payload.id === reviewId) {
+          review = event.payload;
+          reviewError = '';
+        }
       }),
-      listen('english-review-failed', () => {
-        if (!review) reviewError = '訂正文を作れませんでした';
+      listen<number>('english-review-failed', (event) => {
+        if (event.payload === reviewId && !review) reviewError = '訂正文を作れませんでした';
       })
     ];
     textarea?.focus();

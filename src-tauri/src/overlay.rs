@@ -74,6 +74,7 @@ pub fn update(app: &AppHandle, view: View, anchor: Option<Rect>) -> tauri::Resul
     *overlay.latest.lock().expect("overlay lock") = view.clone();
     if is_hidden(&view) {
         overlay.wanted.store(false, Ordering::Relaxed);
+        app.emit_to(LABEL, VIEW_EVENT, &view)?;
         return window.hide();
     }
     overlay.wanted.store(true, Ordering::Relaxed);
@@ -86,7 +87,8 @@ pub fn update(app: &AppHandle, view: View, anchor: Option<Rect>) -> tauri::Resul
 /// 候補ウインドウを隠す。`view` は確定した後の内容で、確定した文字列を最後の内容として残さないために置き換える。
 pub fn hide(app: &AppHandle, view: View) -> tauri::Result<()> {
     let overlay = app.state::<Overlay>();
-    *overlay.latest.lock().expect("overlay lock") = view;
+    *overlay.latest.lock().expect("overlay lock") = view.clone();
+    app.emit_to(LABEL, VIEW_EVENT, &view)?;
     overlay.wanted.store(false, Ordering::Relaxed);
     match app.get_webview_window(LABEL) {
         Some(window) => window.hide(),

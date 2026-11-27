@@ -175,7 +175,7 @@ fn read_answers(stdout: impl BufRead, asked: &Mutex<Option<Asked>>, available: &
     for line in lines {
         let event = {
             let mut asked = asked.lock().expect("asked lock");
-            let current = asked.as_ref().map(|asked| (asked.id, asked.text.clone()));
+            let current = asked.as_ref().filter(|asked| asked.waiting).map(|asked| (asked.id, asked.text.clone()));
             let event = parse_answer(&line, current.as_ref());
             if let (Some(_), Some(asked)) = (&event, asked.as_mut()) {
                 asked.waiting = false;
@@ -383,6 +383,36 @@ sleep 30"#;
         // Assert
         assert!(matches!(events.recv_timeout(WAIT), Ok(Event::Review(_))));
         assert!(events.recv_timeout(timeout * 2).is_err());
+    }
+
+    #[test]
+    fn answers_after_a_timeout_are_dropped() {
+        for answer in [
+            r#"{"id":9,"corrected":"I have a pen."}"#,
+            r#"{"id":9,"error":"late failure"}"#,
+        ] {
+            // Arrange
+            let asked = Mutex::new(Some(Asked {
+                id: 9,
+                text: "I has a pen".to_string(),
+                at: Instant::now(),
+                waiting: false,
+            }));
+            let available = AtomicBool::new(false);
+            let input = format!("{{\"available\":true}}\n{answer}\n");
+            let (sender, events) = mpsc::channel();
+
+            // Act
+            read_answers(input.as_bytes(), &asked, &available, &|event| {
+                sender.send(event).unwrap();
+            });
+
+            // Assert: EOF の知らせだけが届き、期限切れの依頼の結果は届かない。
+            assert_eq!(
+                events.try_iter().collect::<Vec<_>>(),
+                vec![Event::Unavailable("the helper stopped".to_string())]
+            );
+        }
     }
 
     #[test]

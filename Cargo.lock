@@ -1869,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "kayoiji"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "kayoiji-check",
  "kayoiji-core",
@@ -1886,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "kayoiji-check"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "kayoiji-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "clap",
  "kayoiji-core",
@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "kayoiji-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "chrono",
  "fst",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "kayoiji-pad"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "kayoiji-check",
  "kayoiji-core",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "kayoiji-windows"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "kayoiji-core",
  "windows",

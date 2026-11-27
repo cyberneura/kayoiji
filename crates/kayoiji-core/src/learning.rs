@@ -207,9 +207,13 @@ impl Learning {
     fn apply(&mut self, change: &Change) -> bool {
         match change {
             Change::Conversion { reading, surface } => {
+                // 区切り直して覚えた語と違う表記を選んだら、その語は忘れる。ほかのプロセスが覚えた語にも
+                // 効くように、保存の時に読み直した記録に重ねる時もここで忘れる。
+                let conflicting = self.phrase(reading).is_some_and(|known| known != surface);
+                let forgotten = conflicting && self.apply(&Change::ForgetPhrase(reading.clone()));
                 let surfaces = self.conversions.entry(reading.clone()).or_default();
                 if surfaces.first() == Some(surface) {
-                    return false;
+                    return forgotten;
                 }
                 surfaces.retain(|known| known != surface);
                 surfaces.insert(0, surface.clone());
@@ -574,6 +578,25 @@ mod tests {
         // Assert
         assert_eq!(Learning::load(&path).expect("loads").conversions("あめ"), ["飴", "雨"]);
         assert_eq!(first.conversions("あめ"), ["飴", "雨"]);
+    }
+
+    #[test]
+    fn a_choice_forgets_a_conflicting_phrase_learned_by_another_process() {
+        // Arrange: このプロセスが読み込んだ後に、もう一方が「はめ → 歯目」を語として覚えた
+        let path = temporary_file("conflicting-phrase");
+        let mut first = Learning::load(&path).expect("empty");
+        Learning::load(&path)
+            .expect("empty")
+            .record_phrase(&words(&[("は", "歯"), ("め", "目")]))
+            .expect("saved");
+
+        // Act
+        first.record_conversion("はめ", "羽目").expect("saved");
+
+        // Assert: 後から選んだ「羽目」が勝ち、もう一方の語は読み込まれない。
+        assert_eq!(Learning::load(&path).expect("loads").phrase("はめ"), None);
+        assert_eq!(first.phrase("はめ"), None);
+        assert!(!first.take_outside_changes());
     }
 
     #[test]

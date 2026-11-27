@@ -25,7 +25,7 @@ use crate::converter::{self, Candidate};
 use crate::detector::{Context, Detector, DetectorConfig, Verdict};
 use crate::emoji_search::{EmojiSearch, EmojiView};
 use crate::kana::to_katakana;
-use crate::learning::Learning;
+use crate::learning::{Learning, Retain};
 use crate::romaji::RomajiTable;
 use crate::rules::Language;
 
@@ -1635,7 +1635,7 @@ impl Engine {
         // 同じ読みの文節で以前に選んだ表記は忘れる。残すと、語より先に出る。
         // ここで語の表記を文節の選択として記録することはしない。「ゆきが」を「雪賀」と覚えた時に
         // 記録すると、「雪が積もる」の文節「ゆきが」まで「雪賀」になる。
-        let saved = self.learning.retain_conversions(&reading, |chosen| chosen == surface);
+        let saved = self.learning.retain_conversions(&reading, Retain::Equal(surface.clone()));
         self.learning_saved(saved);
         // この語を含む読みで以前に選んだ表記が残っていると、助詞が付いた読みでは、語を覚える前の
         // 選択が先頭に出続ける。変換にこの語が使われる読みに限って、語を使っていない選択を忘れる。
@@ -1649,7 +1649,7 @@ impl Engine {
             if !uses_phrase {
                 continue;
             }
-            let saved = self.learning.retain_conversions(&known, |chosen| chosen.contains(&surface));
+            let saved = self.learning.retain_conversions(&known, Retain::Containing(surface.clone()));
             self.learning_saved(saved);
         }
     }

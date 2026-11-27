@@ -24,11 +24,29 @@ struct Phrase {
     words: Vec<(String, String)>,
 }
 
+/// 文節で選んだ表記のうち、残すもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retain {
+    /// この表記だけを残す。
+    Equal(String),
+    /// この文字列を含む表記だけを残す。
+    Containing(String),
+}
+
+impl Retain {
+    fn keeps(&self, surface: &str) -> bool {
+        match self {
+            Retain::Equal(kept) => surface == kept,
+            Retain::Containing(part) => surface.contains(part.as_str()),
+        }
+    }
+}
+
 /// 記録への 1 回の変更。保存する時に、ほかのプロセスが書いた内容に重ね直す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Change {
     Conversion { reading: String, surface: String },
-    DropConversions { reading: String, surfaces: Vec<String> },
+    RetainConversions { reading: String, retain: Retain },
     Phrase(Phrase),
     ForgetPhrase(String),
     Language { word: String, language: Language, in_flow: bool },
@@ -152,17 +170,11 @@ impl Learning {
         })
     }
 
-    /// `reading` の文節で選んだ表記のうち、`keep` が false を返すものを忘れる。
-    pub fn retain_conversions(&mut self, reading: &str, keep: impl Fn(&str) -> bool) -> io::Result<()> {
-        let surfaces = self
-            .conversions(reading)
-            .iter()
-            .filter(|surface| !keep(surface))
-            .cloned()
-            .collect();
-        self.record(Change::DropConversions {
+    /// `reading` の文節で選んだ表記のうち、`retain` に当たらないものを忘れる。
+    pub fn retain_conversions(&mut self, reading: &str, retain: Retain) -> io::Result<()> {
+        self.record(Change::RetainConversions {
             reading: reading.to_string(),
-            surfaces,
+            retain,
         })
     }
 
@@ -220,12 +232,12 @@ impl Learning {
                 surfaces.truncate(SURFACES_PER_READING);
                 true
             }
-            Change::DropConversions { reading, surfaces } => {
+            Change::RetainConversions { reading, retain } => {
                 let Some(known) = self.conversions.get_mut(reading) else {
                     return false;
                 };
                 let count = known.len();
-                known.retain(|surface| !surfaces.contains(surface));
+                known.retain(|surface| retain.keeps(surface));
                 let changed = known.len() != count;
                 if known.is_empty() {
                     self.conversions.remove(reading);
@@ -437,7 +449,7 @@ mod tests {
         // Act
         let readings = learning.readings_containing("かよいじ");
         learning
-            .retain_conversions("かよいじを", |surface| surface.contains("通い路"))
+            .retain_conversions("かよいじを", Retain::Containing("通い路".to_string()))
             .expect("saved");
 
         // Assert
@@ -597,6 +609,22 @@ mod tests {
         assert_eq!(Learning::load(&path).expect("loads").phrase("はめ"), None);
         assert_eq!(first.phrase("はめ"), None);
         assert!(!first.take_outside_changes());
+    }
+
+    #[test]
+    fn retaining_conversions_also_applies_to_choices_of_another_process() {
+        // Arrange: このプロセスが読み込んだ後に、もう一方が「かよいじを」で「通地を」を選んだ
+        let path = temporary_file("retain-outside");
+        let mut first = Learning::load(&path).expect("empty");
+        Learning::load(&path).expect("empty").record_conversion("かよいじを", "通地を").expect("saved");
+
+        // Act
+        first
+            .retain_conversions("かよいじを", Retain::Containing("通い路".to_string()))
+            .expect("saved");
+
+        // Assert
+        assert!(Learning::load(&path).expect("loads").conversions("かよいじを").is_empty());
     }
 
     #[test]

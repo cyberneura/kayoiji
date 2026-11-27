@@ -1,0 +1,65 @@
+name: Windows
+
+# Windows 版 (crates/kayoiji-windows、TSF の入力メソッドの DLL) のビルドとテスト。
+# 入力先のアプリは 64 bit と 32 bit の両方があり、DLL はアプリのプロセスに読み込まれるので、両方を作る。
+# 実際に日本語を打つ確認は、Windows の機械で入力方式として登録してから行う (README の Windows の節)。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc
+
+      - name: Cache Rust (cargo + target)
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # エンジンは OS に依存しないが、ファイルの扱い (学習のロック、パス) は OS ごとに違うので、Windows でも通す。
+      - name: Run tests
+        run: cargo test --locked -p kayoiji-core -p kayoiji-windows
+
+      - name: Clippy
+        run: cargo clippy --locked -p kayoiji-windows --all-targets -- -D warnings
+
+      - name: Build the 64-bit and 32-bit DLLs
+        run: |
+          cargo build --locked --release -p kayoiji-windows --target x86_64-pc-windows-msvc
+          cargo build --locked --release -p kayoiji-windows --target i686-pc-windows-msvc
+
+      # DLL が TSF から呼ばれる関数を書き出しているかを確かめる。書き出していないと、regsvr32 で登録できない。
+      - name: Check the exported functions
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          foreach ($target in @('x86_64-pc-windows-msvc', 'i686-pc-windows-msvc')) {
+            $dll = "target\$target\release\kayoiji_windows.dll"
+            $exports = & $dumpbin.FullName /exports $dll | Out-String
+            foreach ($name in @('DllGetClassObject', 'DllCanUnloadNow', 'DllRegisterServer', 'DllUnregisterServer')) {
+              if ($exports -notmatch "\b$name\b") {
+                Write-Error "$dll does not export $name"
+                exit 1
+              }
+            }
+            Write-Output "$dll exports the COM entry points"
+          }

@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use kayoiji_core::engine::EngineConfig;
+use crate::engine::EngineConfig;
 use serde::{Deserialize, Serialize};
 
 /// 設定できる打鍵の間隔の範囲 (ミリ秒)。

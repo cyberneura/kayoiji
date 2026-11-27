@@ -10,6 +10,9 @@ macOS の日本語入力メソッド。「かな」「英数」キーで切り�
 - `crates/kayoiji-check`: 英文チェックの部品。綴りの検査 (`spelling.rs`) と、言語モデルの補助プロセス
   (`helper/english-check.swift`) の呼び出し (`review.rs`)
 - `crates/kayoiji-cli`: 辞書のビルド、動作確認 (`type`、`explain`)、精度の評価 (`evaluate`)
+- `crates/kayoiji-windows`: Windows 版。TSF のテキストサービスの DLL。入力先のプロセスに読み込まれ、
+  スレッドごとにエンジンを持つ。候補ウインドウは Win32 と GDI で描く (`tsf/window.rs`)。OS に依存しない
+  キーの読み替え (`keys.rs`) と候補ウインドウの内容 (`panel.rs`) はどの OS でもテストする
 - `src-tauri`: Tauri アプリ。`imk.rs` が InputMethodKit との接続、`overlay.rs` が候補ウインドウ
 - `pad/src-tauri`: KayoijiPad。エンジンを入力メソッドとして入れずに試すための、テキストエリアだけのアプリ
 - `src`: SvelteKit のフロントエンド (`/overlay`、`/settings`、KayoijiPad の `/pad`)。
@@ -89,6 +92,9 @@ pnpm pad                     # KayoijiPad を開発モードで起動する
   綴りの訂正候補を作る処理 (1 語あたり数十ミリ秒) も打鍵のたびには行わず、打鍵が止まってから行う (`Guesses::Lookup`)
 - 辞書の形式 (`dict.rs` の `MAGIC`) を変えたら、`pnpm data` で `data/build` を作り直す
 - 辞書の元データ (`data/raw`) とビルドした辞書 (`data/build`) はコミットしない
+- Windows 版 (`crates/kayoiji-windows/src/tsf`) は、macOS でも `cargo check -p kayoiji-windows --target x86_64-pc-windows-msvc`
+  で型を検査できる (リンクはできない)。ビルドとテストは `.github/workflows/windows.yml` の Windows の runner で行う。
+  TSF は編集セッションの途中でこちらのメソッドを呼び返すことがあるので、状態の `RefCell` を借りたまま TSF を呼ばない
 - リリースは `.github/workflows/release.yml` が行う。main の版 (`Cargo.toml` の workspace、`package.json`、
   `src-tauri/tauri.conf.json`、`pad/src-tauri/tauri.conf.json`。4 か所をそろえる) がまだリリースしていない版なら、
   macOS 26 の runner で辞書と補助プロセスを作り、`Kayoiji.app` を Developer ID で署名・公証して zip を Release に添付する。

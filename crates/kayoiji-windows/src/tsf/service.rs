@@ -77,7 +77,7 @@ struct Decision {
     /// 候補ウインドウの表示内容が変わったかどうか。文書に書かない打鍵でも、候補ウインドウは出し直す。
     view_changed: bool,
     /// 確定を書いた後に、入力先に通すために送り直すキー。
-    resend: Option<u16>,
+    resend: Option<Resent>,
 }
 
 impl Decision {
@@ -90,6 +90,15 @@ impl Decision {
     }
 }
 
+/// 送り直すキーと、押した時に押されていた修飾キー。
+#[derive(Debug, Clone, Copy)]
+struct Resent {
+    vk: u16,
+    shift: bool,
+    control: bool,
+    alt: bool,
+}
+
 /// 文書への 1 回の書き込み。
 enum Edit {
     Output(Output),
@@ -98,7 +107,7 @@ enum Edit {
     /// 文書は変えずに、候補ウインドウだけを今の表示内容にする (絵文字モードを抜けてキーを通した時など)。
     Refresh,
     /// 確定してから入力先に通すキーを送り直す。前の書き込みが済んでから送らないと、確定より先にキーが届く。
-    Resend(u16),
+    Resend(Resent),
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfCompositionSink, ITfThreadMgrEventSink, ITfCompartmentEventSink)]
@@ -309,7 +318,7 @@ impl TextService_Impl {
                 Edit::Finish => self.finish(cookie, context)?,
                 // SAFETY: 編集セッションの中で、未確定文字列かキャレットの位置を読む。
                 Edit::Refresh => unsafe { self.refresh(cookie, context) },
-                Edit::Resend(vk) => resend(vk),
+                Edit::Resend(key) => resend(key),
             }
         }
         // ほかの文書の分が先頭に残った。その文書のために頼んだ編集セッションが先に動いて、何も書かずに
@@ -523,7 +532,14 @@ impl TextService_Impl {
                 match key {
                     Key::Space => output.commit.push(' '),
                     Key::Char(c) => output.commit.push(c),
-                    _ => resend = Some(stroke.vk),
+                    _ => {
+                        resend = Some(Resent {
+                            vk: stroke.vk,
+                            shift: stroke.shift,
+                            control: stroke.control,
+                            alt: stroke.alt,
+                        })
+                    }
                 }
                 output.consumed = true;
                 Some(output)
@@ -577,8 +593,8 @@ impl TextService_Impl {
         if let Some(output) = decision.output {
             self.apply(context, Edit::Output(output), true);
         }
-        if let Some(vk) = decision.resend {
-            self.apply(context, Edit::Resend(vk), true);
+        if let Some(key) = decision.resend {
+            self.apply(context, Edit::Resend(key), true);
         }
         if decision.mode_changed {
             self.sync_compartment();
@@ -654,9 +670,26 @@ impl TextService_Impl {
 }
 
 /// 確定の後に、キーを入力先に送り直す。目印を付けて、エンジンには渡さない。
-fn resend(vk: u16) {
+/// 送るまでの間に修飾キーが離されていたら、押した時の組み合わせ (Ctrl+C など) になるように、修飾キーも送る。
+fn resend(key: Resent) {
+    // SAFETY: キーの状態を読むだけ。
+    let pressed = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
+    let modifiers: Vec<u16> = [(key.shift, keys::VK_SHIFT), (key.control, keys::VK_CONTROL), (key.alt, keys::VK_MENU)]
+        .into_iter()
+        .filter(|&(held, vk)| held && !pressed(vk))
+        .map(|(_, vk)| vk)
+        .collect();
+    let mut events: Vec<INPUT> = modifiers.iter().map(|&vk| key_event(vk, false)).collect();
+    events.push(key_event(key.vk, false));
+    events.push(key_event(key.vk, true));
+    events.extend(modifiers.iter().rev().map(|&vk| key_event(vk, true)));
+    // SAFETY: 組み立てたキーの入力を送る。
+    unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
+}
+
+fn key_event(vk: u16, up: bool) -> INPUT {
     let extended = matches!(vk, 0x21..=0x28 | 0x2D | 0x2E);
-    let event = |up: bool| INPUT {
+    INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
@@ -669,9 +702,7 @@ fn resend(vk: u16) {
                 dwExtraInfo: RESENT,
             },
         },
-    };
-    // SAFETY: 押して離すキーの入力を 2 つ送る。
-    unsafe { SendInput(&[event(false), event(true)], std::mem::size_of::<INPUT>() as i32) };
+    }
 }
 
 /// 選択範囲が無い時の、キャレットの直前の `length` 単位 (UTF-16) の文字列。選択範囲がある時はエラー。
@@ -835,8 +866,18 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 
 impl ITfCompositionSink_Impl for TextService_Impl {
     /// 入力先が未確定文字列を終わらせた (クリックなど)。表示していた文字列は、入力先に確定されたまま残る。
-    fn OnCompositionTerminated(&self, _cookie: u32, _composition: Ref<ITfComposition>) -> windows_core::Result<()> {
+    fn OnCompositionTerminated(&self, _cookie: u32, composition: Ref<ITfComposition>) -> windows_core::Result<()> {
         self.composition.borrow_mut().take();
+        // 終わった未確定文字列への書き込みが積んであれば捨てる。残すと、新しい未確定文字列を作って書き直す。
+        // SAFETY: 終わった未確定文字列の範囲が、どの文書のものかを読む。
+        let owner = composition
+            .as_ref()
+            .and_then(|composition| unsafe { composition.GetRange().and_then(|range| range.GetContext()) }.ok());
+        if let Some(owner) = owner {
+            self.queue
+                .borrow_mut()
+                .retain(|(target, edit)| target != &owner || matches!(edit, Edit::Resend(_)));
+        }
         if let Some(active) = self.active.borrow_mut().as_mut() {
             active.decided = None;
             if let Some(engine) = active.engine.as_mut() {

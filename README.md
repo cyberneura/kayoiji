@@ -273,21 +273,21 @@ MIT ([LICENSE](LICENSE))。同梱する第三者のライブラリと辞書・�
 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) にある (アプリの `Contents/Resources` にも入っている)。
 データの出典は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
-## Windows 版 (開発中)
+## Windows 版
 
-Windows の入力方式 (TSF のテキストサービス) として動く版を、`crates/kayoiji-windows` で作っている。
-変換、学習、自動切り替え、日本語入力から自動で抜ける設定は macOS 版と同じ。英文チェックは無い
-(macOS のスペルチェッカーと言語モデルを使うため)。インストーラーはまだ無いので、次の手順で入れる。
+Windows の入力方式 (TSF のテキストサービス) として動く。変換、学習、自動切り替え、日本語入力から自動で抜ける設定は
+macOS 版と同じ。英文チェックは無い (macOS のスペルチェッカーと言語モデルを使うため)。
 
-1. `pnpm data` で辞書を作る (Git Bash などの bash で動かす)
-2. `cargo build --release -p kayoiji-windows --target x86_64-pc-windows-msvc` と、32 bit のアプリ用に
-   `--target i686-pc-windows-msvc` でも DLL を作る
-3. 1 つのフォルダーに DLL を置き、その下の `data` に `data/build` の辞書 (`kayoiji.dict`、`english.fst`、`symbols.dict`、
-   `emoji.dict`、`emoji.json`) を置く。32 bit の DLL は名前を変えて同じフォルダーに置いてよい
-4. 管理者の権限で `regsvr32 kayoiji_windows.dll` (32 bit の DLL は `%SystemRoot%\SysWOW64\regsvr32.exe` で) を実行する
-5. 「設定 → 時刻と言語 → 言語と地域 → 日本語 → 言語のオプション → キーボードの追加」で Kayoiji を追加する
+[Releases](https://github.com/cyberneura/kayoiji/releases) の `Kayoiji_<版>_windows_setup.exe` を実行して入れる
+(64 bit 版の Windows。署名していないので、SmartScreen の警告が出たら「詳細情報 → 実行」)。
+入れた後に「設定 → 時刻と言語 → 言語と地域 → 日本語 → 言語のオプション → キーボードの追加」で Kayoiji を追加する。
 
-外す時は `regsvr32 /u kayoiji_windows.dll`。
+- 64 bit と 32 bit のアプリのどちらでも使えるように、両方の DLL を登録する
+- 版ごとのフォルダー (`C:\Program Files\Kayoiji\<版>`) に入れる。入れ替えた時、動いているアプリは起動し直すまで前の版で動く。
+  前の版のフォルダーは、再起動の時に消える
+- 外す時は「設定 → アプリ」で Kayoiji をアンインストールする。`%APPDATA%\Kayoiji` の設定と学習は残る
+
+ソースからは、Windows の上の bash (Git Bash) で `scripts/build-windows-installer.sh` を実行して作る (makensis が要る)。
 
 | キー | 動作 |
 |---|---|
@@ -347,6 +347,7 @@ cargo run --release -p kayoiji-cli -- evaluate                        # 実デ�
 | `helper/english-check.swift` | 英文チェックの補助プロセス。Mac の言語モデルに訂正文と訳を頼む |
 | `crates/kayoiji-cli` | 辞書のビルド、ターミナルからの動作確認、精度の評価 |
 | `crates/kayoiji-windows` | Windows 版。TSF のテキストサービスの DLL (`tsf`)、キーの読み替え (`keys.rs`)、候補ウインドウの内容 (`panel.rs`) |
+| `installer/windows` | Windows 版のインストーラー (NSIS)。`scripts/build-windows-installer.sh` が作る |
 | `src-tauri` | Tauri アプリ。InputMethodKit との接続 (`imk.rs`)、候補ウインドウ、設定 |
 | `src-tauri/Info.plist` | 入力メソッドとして OS に認識させるための設定 |
 | `pad/src-tauri` | KayoijiPad。エンジンを試すためのテキストエリアのアプリ |

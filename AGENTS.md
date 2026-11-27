@@ -95,6 +95,10 @@ pnpm pad                     # KayoijiPad を開発モードで起動する
 - Windows 版 (`crates/kayoiji-windows/src/tsf`) は、macOS でも `cargo check -p kayoiji-windows --target x86_64-pc-windows-msvc`
   で型を検査できる (リンクはできない)。ビルドとテストは `.github/workflows/windows.yml` の Windows の runner で行う。
   TSF は編集セッションの途中でこちらのメソッドを呼び返すことがあるので、状態の `RefCell` を借りたまま TSF を呼ばない
+- Windows 版のインストーラー (`installer/windows/kayoiji.nsi`) は、版ごとのフォルダーに DLL と辞書を入れて登録し直す。
+  入力方式の DLL は動いているアプリが読み込んだまま放さないので、同じ場所には上書きできない。リリースでは
+  `release.yml` の `build-windows` が作って Release に添付する。Windows 版の依存のライセンスは `THIRD-PARTY-NOTICES-windows.txt`
+  (`pnpm notices` が作る。直接の依存が載っていないと `kayoiji-windows` のテストが落ちる)
 - リリースは `.github/workflows/release.yml` が行う。main の版 (`Cargo.toml` の workspace、`package.json`、
   `src-tauri/tauri.conf.json`、`pad/src-tauri/tauri.conf.json`。4 か所をそろえる) がまだリリースしていない版なら、
   macOS 26 の runner で辞書と補助プロセスを作り、`Kayoiji.app` を Developer ID で署名・公証して zip を Release に添付する。

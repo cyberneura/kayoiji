@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
+  import EmojiGrid from '$lib/EmojiGrid.svelte';
   import {
     adoptNativeEdit,
     applyOutput,
@@ -30,7 +31,8 @@
     candidates: [],
     selected: null,
     page: 0,
-    page_count: 0
+    page_count: 0,
+    emoji: null
   };
 
   let textarea = $state<HTMLTextAreaElement>();
@@ -323,6 +325,8 @@
           {/each}
           <li class="text-xs text-gray-500 dark:text-gray-400">{view.page + 1}/{view.page_count}</li>
         </ol>
+      {:else if view.mode === 'emoji'}
+        <EmojiGrid {view} />
       {:else if view.mode === 'checking' && view.reading.trim()}
         <dl data-annotate="panel-english-check" class="flex flex-col gap-1 text-xs">
           {#if spelling && spelling.misspellings.length > 0}

@@ -37,6 +37,15 @@
     ['英数', '英文を確定して、直接入力にする'],
     ['かな', '英文を確定して、日本語入力 (自動切り替えが有効なら自動切り替え) にする']
   ];
+  const emojiKeys = [
+    ['文字のキー', '検索語を打つ (ローマ字でかなにして、英語のキーワードも引く)'],
+    ['← → ↑ ↓ / Space', '絵文字を選ぶ'],
+    ['Shift + ← / →', '前後の分類の一覧にする'],
+    ['Tab', '肌の色の違いを出す / 閉じる'],
+    ['Enter', '選んだ絵文字を確定する'],
+    ['Backspace', '検索語を 1 文字消す。空なら絵文字モードをやめる'],
+    ['Esc', '肌の色の違いを閉じる。出ていなければ、絵文字モードをやめる']
+  ];
   const keys = $derived([...commonKeys, ...(status?.settings.auto_switch ? autoKeys : japaneseKeys)]);
 
   async function refresh() {
@@ -171,6 +180,17 @@
       <h3 class="mt-2 text-sm font-medium">英文チェック</h3>
       <dl class="flex flex-col gap-1">
         {#each englishKeys as [key, description]}
+          <div class="flex gap-3">
+            <dt class="w-44 shrink-0 font-mono text-xs leading-5 text-gray-600 dark:text-gray-300">
+              {key}
+            </dt>
+            <dd>{description}</dd>
+          </div>
+        {/each}
+      </dl>
+      <h3 class="mt-2 text-sm font-medium">絵文字モード (「えもじ」の候補の「絵文字を探す」で入る)</h3>
+      <dl class="flex flex-col gap-1">
+        {#each emojiKeys as [key, description]}
           <div class="flex gap-3">
             <dt class="w-44 shrink-0 font-mono text-xs leading-5 text-gray-600 dark:text-gray-300">
               {key}

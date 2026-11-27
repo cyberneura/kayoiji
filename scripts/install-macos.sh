@@ -5,7 +5,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-for file in kayoiji.dict english.fst symbols.dict; do
+for file in kayoiji.dict english.fst symbols.dict emoji.dict emoji.json; do
   if [[ ! -s "data/build/$file" ]]; then
     pnpm data
     break

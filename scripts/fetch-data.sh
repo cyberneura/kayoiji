@@ -38,4 +38,9 @@ fetch "https://raw.githubusercontent.com/google/mozc/${MOZC_SHA}/LICENSE" "data/
 fetch "$WIKIFREQ_BASE/results/enwiki-2023-04-13.txt" "data/raw/english/enwiki-2023-04-13.txt"
 fetch "$WIKIFREQ_BASE/LICENSE" "data/raw/english/LICENSE"
 
+# 絵文字の一覧と、キーワードから絵文字を引く索引 (emoji-explorer)。版を固定する手段が無いので、
+# 取得し直すと内容が変わることがある。
+fetch "https://emoji.ytyng.com/emoji.ja.json" "data/raw/emoji/emoji.ja.json"
+fetch "https://emoji.ytyng.com/search-index.json" "data/raw/emoji/search-index.json"
+
 echo "done: data/raw"

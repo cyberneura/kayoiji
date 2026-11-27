@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::converter::{self, Candidate};
 use crate::detector::{Context, Detector, DetectorConfig, Verdict};
+use crate::emoji_search::{EmojiSearch, EmojiView};
 use crate::kana::to_katakana;
 use crate::learning::Learning;
 use crate::romaji::RomajiTable;
@@ -37,6 +38,10 @@ const PHRASE_MAX_CHARS: usize = 12;
 /// 「英数」の 2 度押しは使えない。「英数」では OS の英字のキーボード配列に切り替わるので、
 /// 2 度目が入力メソッドに届かない。
 pub const DOUBLE_PRESS_MS: u64 = 400;
+
+/// この読みの候補に、絵文字モードに入る候補を置く。
+const EMOJI_SEARCH_READING: &str = "えもじ";
+const EMOJI_SEARCH_CANDIDATE: &str = "絵文字を探す";
 /// 覚える語を作る、辞書の語の数の下限。辞書の 1 語を分けて選んだだけなら、辞書がすでに変換できる。
 const PHRASE_MIN_WORDS: usize = 2;
 
@@ -195,6 +200,8 @@ pub enum Mode {
     Converting,
     /// 英文チェックで、英文を受け取っている。`View::reading` がその英文。
     Checking,
+    /// 絵文字モード。`View::candidates` が一覧の絵文字、`View::emoji` がそのほかの内容。
+    Emoji,
 }
 
 /// 候補ウインドウに表示する内容。
@@ -212,6 +219,7 @@ pub struct View {
     pub selected: Option<usize>,
     pub page: usize,
     pub page_count: usize,
+    pub emoji: Option<EmojiView>,
 }
 
 #[derive(Debug)]
@@ -307,11 +315,25 @@ struct ConvertingSegment {
     reading: String,
     candidates: Vec<Candidate>,
     selected: usize,
+    /// 絵文字モードに入る候補 (「絵文字を探す」) の位置。
+    emoji_search_at: Option<usize>,
 }
 
 impl ConvertingSegment {
     fn surface(&self) -> &str {
         &self.candidates[self.selected].surface
+    }
+
+    fn opens_emoji_search(&self) -> bool {
+        self.emoji_search_at == Some(self.selected)
+    }
+
+    /// 絵文字モードに入らずに確定する時の表記。「絵文字を探す」を選んでいれば、単語の「絵文字」にする。
+    fn committed_surface(&self) -> &str {
+        if self.opens_emoji_search() {
+            return &self.candidates[0].surface;
+        }
+        self.surface()
     }
 }
 
@@ -334,6 +356,20 @@ struct Converting {
 impl Converting {
     fn display(&self) -> String {
         self.segments.iter().map(ConvertingSegment::surface).collect()
+    }
+
+    /// 絵文字モードに入らずに確定する時の文字列。
+    fn committed_text(&self) -> String {
+        self.segments.iter().map(ConvertingSegment::committed_surface).collect()
+    }
+
+    /// 「絵文字を探す」を選んでいたら、単語の「絵文字」を選び直す。絵文字モードに入らずに確定する前に呼ぶ。
+    fn decline_emoji_search(&mut self) {
+        for segment in &mut self.segments {
+            if segment.opens_emoji_search() {
+                segment.selected = 0;
+            }
+        }
     }
 
     fn focused(&mut self) -> &mut ConvertingSegment {
@@ -411,6 +447,8 @@ pub struct Engine {
     last_error: Option<io::Error>,
     /// 英文チェックで受け取っている英文。
     english: String,
+    /// 絵文字モード。入っていなければ `None`。
+    emoji_search: Option<EmojiSearch>,
     /// 最後に「かな」が押された時刻。2 度押しを見分ける。
     last_henkan_ms: Option<u64>,
 }
@@ -434,6 +472,7 @@ impl Engine {
             force_next: false,
             last_error: None,
             english: String::new(),
+            emoji_search: None,
             last_henkan_ms: None,
             config,
         }
@@ -467,6 +506,7 @@ impl Engine {
         self.english_streak = 0;
         self.force_next = false;
         self.english.clear();
+        self.emoji_search = None;
     }
 
     pub fn input_mode(&self) -> InputMode {
@@ -500,6 +540,7 @@ impl Engine {
             // 打鍵したままの英字で確定する。
             State::Composing { raw, .. } if self.leaves_auto_for_direct(mode) => raw.clone(),
             State::Converting(converting) if self.leaves_auto_for_direct(mode) => converting.raw.clone(),
+            State::Converting(converting) => converting.committed_text(),
             _ => self.preedit(),
         };
         self.reset();
@@ -514,13 +555,21 @@ impl Engine {
     /// 未確定文字列を、表示されているとおりに確定する。入力先が切り替わる時に呼ぶ。
     /// 戻り値は、入力先に確定する文字列。
     pub fn commit_composition(&mut self) -> String {
-        let text = self.preedit();
+        let text = match &self.state {
+            State::Converting(converting) => converting.committed_text(),
+            _ => self.preedit(),
+        };
         self.reset();
         text
     }
 
     /// 現在の未確定文字列。
     pub fn preedit(&self) -> String {
+        // 絵文字モードの検索語は、候補ウインドウにだけ出す。入力先に未確定文字列として出すと、
+        // 入力先が切り替わった時などに、検索語が確定されてしまう。
+        if self.emoji_search.is_some() {
+            return String::new();
+        }
         if self.input_mode == InputMode::English {
             return self.english.clone();
         }
@@ -542,7 +591,17 @@ impl Engine {
             selected: None,
             page: 0,
             page_count: 0,
+            emoji: None,
         };
+        if let Some(search) = &self.emoji_search {
+            return View {
+                mode: Mode::Emoji,
+                candidates: search.items(),
+                selected: search.selected(),
+                emoji: Some(search.view()),
+                ..idle
+            };
+        }
         if self.input_mode == InputMode::English {
             return View {
                 mode: Mode::Checking,
@@ -619,6 +678,9 @@ impl Engine {
 
     /// 打鍵を 1 つ処理する。`time_ms` は単調増加する時刻。
     pub fn handle(&mut self, key: Key, time_ms: u64) -> Output {
+        if self.emoji_search.is_some() && key != Key::Muhenkan {
+            return self.handle_emoji(key);
+        }
         // 2 度押しを数えるのは、何も入力していない時の「かな」だけ。自動切り替えでは、入力中の「かな」は
         // 変換と次の候補に使うので、続けて押すのが普通の操作になる。
         let counts = key == Key::Henkan && self.input_mode != InputMode::English && self.preedit().is_empty();
@@ -676,6 +738,69 @@ impl Engine {
     /// 選び直した直後の打鍵は、切り替えの一部としてエンジンに渡さない。
     pub fn mark_henkan(&mut self, time_ms: u64) {
         self.last_henkan_ms = Some(time_ms);
+    }
+
+    /// 絵文字モードの打鍵。文字で検索語を打ち、矢印で選び、Enter で確定する。
+    fn handle_emoji(&mut self, key: Key) -> Output {
+        let search = self.emoji_search.as_mut().expect("in the emoji search");
+        let step = match key {
+            Key::Char(c) => {
+                search.type_char(c);
+                Step::consume()
+            }
+            Key::Backspace => {
+                // 検索語が空なら、絵文字モードをやめる。
+                if !search.backspace() {
+                    self.emoji_search = None;
+                }
+                Step::consume()
+            }
+            Key::Space | Key::Right => {
+                search.move_selection(1, 0);
+                Step::consume()
+            }
+            Key::Left => {
+                search.move_selection(-1, 0);
+                Step::consume()
+            }
+            Key::Up => {
+                search.move_selection(0, -1);
+                Step::consume()
+            }
+            Key::Down => {
+                search.move_selection(0, 1);
+                Step::consume()
+            }
+            Key::ShiftLeft | Key::ShiftRight => {
+                search.switch_group(key == Key::ShiftRight);
+                Step::consume()
+            }
+            Key::Tab => {
+                search.toggle_variants();
+                Step::consume()
+            }
+            Key::Enter => match search.chosen() {
+                Some(text) => {
+                    self.emoji_search = None;
+                    self.finish_japanese();
+                    Step::commit(text)
+                }
+                None => Step::consume(),
+            },
+            Key::Escape => {
+                if !search.close_variants() {
+                    self.emoji_search = None;
+                }
+                Step::consume()
+            }
+            // カーソル移動やショートカットは、絵文字モードをやめてから入力先に通す。
+            Key::Other => {
+                self.emoji_search = None;
+                Step::pass()
+            }
+            Key::Henkan | Key::Muhenkan | Key::ForceJapanese | Key::ForceEnglish | Key::Katakana => Step::consume(),
+        };
+        self.output(step)
     }
 
     /// 英文チェックの打鍵。文字は英文に足し、Enter で確定する。英文が空の間は、文字以外の
@@ -770,6 +895,12 @@ impl Engine {
             Key::Space if self.preedit().is_empty() => ' ',
             _ => return None,
         };
+        // 「絵文字を探す」を選んでいる時の文字は、絵文字モードの検索語の 1 文字目にする。
+        if let State::Converting(converting) = &self.state {
+            if converting.segments.iter().any(ConvertingSegment::opens_emoji_search) {
+                return None;
+            }
+        }
         let completes_rule = match &self.state {
             State::Composing { raw, .. } => completes_rule(raw, c),
             _ => false,
@@ -1187,13 +1318,15 @@ impl Engine {
                 })
                 .collect()
         };
-        self.state = State::Converting(Converting {
+        let mut converting = Converting {
             raw,
             tentative,
             segments,
             focus: 0,
             converted_ends,
-        });
+        };
+        self.offer_emoji_search(&mut converting);
+        self.state = State::Converting(converting);
         Step::consume()
     }
 
@@ -1217,7 +1350,39 @@ impl Engine {
             reading: segment.reading,
             candidates,
             selected: 0,
+            emoji_search_at: None,
         }
+    }
+
+    /// 変換が「えもじ」の 1 文節だけなら、単語の「絵文字」の次に、絵文字モードに入る候補を置く。
+    /// 文節がほかにもある時は置かない。絵文字は、確定した文字列の後ろにしか入れられない。
+    fn offer_emoji_search(&self, converting: &mut Converting) {
+        for segment in &mut converting.segments {
+            if let Some(at) = segment.emoji_search_at.take() {
+                segment.candidates.remove(at);
+                if segment.selected >= at {
+                    segment.selected = segment.selected.saturating_sub(1);
+                }
+            }
+        }
+        let [segment] = converting.segments.as_mut_slice() else {
+            return;
+        };
+        if segment.reading != EMOJI_SEARCH_READING || self.detector.converter().emoji().is_none() {
+            return;
+        }
+        let at = segment.candidates.len().min(1);
+        segment.candidates.insert(
+            at,
+            Candidate {
+                surface: EMOJI_SEARCH_CANDIDATE.to_string(),
+                learnable: false,
+            },
+        );
+        if segment.selected >= at {
+            segment.selected += 1;
+        }
+        segment.emoji_search_at = Some(at);
     }
 
     /// 候補を選んでいる文節を 1 文字伸ばす、または縮める。後ろの文節は変換し直す。
@@ -1274,6 +1439,7 @@ impl Engine {
             }
             Key::ShiftLeft | Key::ShiftRight => {
                 self.resize_segment(&mut converting, key == Key::ShiftRight);
+                self.offer_emoji_search(&mut converting);
                 self.state = State::Converting(converting);
                 Step::consume()
             }
@@ -1320,11 +1486,19 @@ impl Engine {
             Key::Char(_) => {
                 // 候補を選んだまま次の文字を打ったら、その候補で確定して入力を続ける。
                 let committed = self.commit(converting);
+                if let Some(search) = &mut self.emoji_search {
+                    // 「絵文字を探す」を選んだまま打った文字は、検索語の 1 文字目にする。
+                    if let Key::Char(c) = key {
+                        search.type_char(c);
+                    }
+                    return committed;
+                }
                 let mut step = self.handle_as_direct(key, time_ms);
                 step.commit.insert_str(0, &committed.commit);
                 step
             }
             Key::Tab | Key::Other => {
+                converting.decline_emoji_search();
                 let committed = self.commit(converting);
                 self.reset();
                 Step::commit_and_pass(committed.commit)
@@ -1332,19 +1506,31 @@ impl Engine {
         }
     }
 
-    /// すべての文節を、選択中の候補で確定する。
+    /// すべての文節を、選択中の候補で確定する。「絵文字を探す」を選んだ文節があれば、ほかの文節を
+    /// 確定して、絵文字モードに入る。
     fn commit(&mut self, converting: Converting) -> Step {
+        let opens_emoji_search = converting.segments.iter().any(ConvertingSegment::opens_emoji_search);
         for segment in &converting.segments {
             let candidate = &segment.candidates[segment.selected];
             if candidate.learnable {
                 self.learn_conversion(&segment.reading, &candidate.surface);
             }
         }
-        for (segments, merged) in converting.regrouped() {
-            self.learn_phrase(&segments, merged);
+        if !opens_emoji_search {
+            for (segments, merged) in converting.regrouped() {
+                self.learn_phrase(&segments, merged);
+            }
         }
-        let text = converting.display();
+        let text: String = converting
+            .segments
+            .iter()
+            .filter(|segment| !segment.opens_emoji_search())
+            .map(ConvertingSegment::surface)
+            .collect();
         self.finish_japanese();
+        if opens_emoji_search {
+            self.emoji_search = self.detector.converter().emoji().cloned().map(EmojiSearch::new);
+        }
         Step::commit(text)
     }
 
@@ -3710,5 +3896,266 @@ mod tests {
         // Assert
         assert_eq!(output.commit, "");
         assert_eq!(output.preedit, "きょう");
+    }
+
+    /// 「えもじ」を変換し、2 番目の候補 (「絵文字を探す」) を選んで確定し、絵文字モードに入る。
+    const OPEN_EMOJI_SEARCH: &str = "emoji  \n";
+
+    fn emoji_view(simulator: &Simulator) -> EmojiView {
+        simulator.engine.view().emoji.expect("in the emoji mode")
+    }
+
+    #[test]
+    fn emoji_search_is_offered_after_the_word_emoji() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run("emoji ");
+
+        // Assert
+        assert_eq!(&simulator.engine.view().candidates[..3], ["絵文字", "絵文字を探す", "えもじ"]);
+    }
+
+    #[test]
+    fn the_word_emoji_is_still_committed_with_space_and_enter() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run("emoji \n");
+
+        // Assert
+        assert_eq!(simulator.text, "絵文字");
+        assert_eq!(simulator.engine.view().mode, Mode::Direct);
+    }
+
+    #[test]
+    fn choosing_emoji_search_opens_the_first_group() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run(OPEN_EMOJI_SEARCH);
+
+        // Assert
+        let view = simulator.engine.view();
+        assert_eq!(simulator.text, "");
+        assert_eq!(view.mode, Mode::Emoji);
+        assert_eq!(view.candidates, ["😺", "☺️"]);
+        assert_eq!(view.selected, Some(0));
+        let emoji = view.emoji.expect("in the emoji mode");
+        assert_eq!(emoji.groups, ["スマイリー", "動物"]);
+        assert_eq!(emoji.group, Some(0));
+        assert_eq!(emoji.name, "笑う猫");
+    }
+
+    #[test]
+    fn typing_in_the_emoji_mode_searches_by_kana_and_english() {
+        // Arrange
+        let mut kana = simulator_with(false);
+        let mut english = simulator_with(false);
+
+        // Act
+        kana.run(&format!("{OPEN_EMOJI_SEARCH}neko"));
+        english.run(&format!("{OPEN_EMOJI_SEARCH}cat"));
+
+        // Assert
+        assert_eq!(kana.engine.view().candidates, ["🐱", "🐈", "😺"]);
+        assert_eq!(emoji_view(&kana).query, "ねこ");
+        assert_eq!(emoji_view(&kana).group, None);
+        assert_eq!(english.engine.view().candidates, ["🐈"]);
+        // 検索語は入力先に出さない。
+        assert_eq!(kana.text, "");
+    }
+
+    #[test]
+    fn enter_commits_the_selected_emoji_and_leaves_the_emoji_mode() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run(&format!("{OPEN_EMOJI_SEARCH}neko{{right}}\n"));
+
+        // Assert
+        assert_eq!(simulator.text, "🐈");
+        assert_eq!(simulator.engine.view().mode, Mode::Direct);
+    }
+
+    #[test]
+    fn shift_arrows_switch_groups_and_arrows_move_in_the_grid() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        let mut wrapped = simulator_with(false);
+
+        // Act
+        simulator.run(&format!("{OPEN_EMOJI_SEARCH}{{sright}}{{right}}{{right}}{{right}}{{left}}"));
+        wrapped.run(&format!("{OPEN_EMOJI_SEARCH}{{sleft}}{{down}}"));
+
+        // Assert
+        assert_eq!(simulator.engine.view().candidates, ["🐱", "🐈", "🐶", "👍", "🤝"]);
+        assert_eq!(simulator.engine.view().selected, Some(2));
+        assert_eq!(emoji_view(&simulator).group, Some(1));
+        // 前のグループは最後のグループに回る。下の行が無ければ最後の絵文字で止まる。
+        assert_eq!(emoji_view(&wrapped).group, Some(1));
+        assert_eq!(wrapped.engine.view().selected, Some(4));
+    }
+
+    #[test]
+    fn switching_groups_clears_the_query() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run(&format!("{OPEN_EMOJI_SEARCH}neko{{sright}}"));
+
+        // Assert: 検索の前に見ていたグループ (最初のグループ) の次の一覧になる。
+        assert_eq!(emoji_view(&simulator).query, "");
+        assert_eq!(emoji_view(&simulator).group, Some(1));
+    }
+
+    #[test]
+    fn tab_shows_the_skin_tones_of_the_selected_emoji() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run(&format!("{OPEN_EMOJI_SEARCH}iine"));
+
+        // Act
+        simulator.run("{tab}");
+        let shown = emoji_view(&simulator);
+        simulator.run("{right}\n");
+
+        // Assert
+        assert_eq!(shown.variants, ["👍", "👍🏻", "👍🏿"]);
+        assert_eq!(shown.variant, Some(0));
+        assert_eq!(simulator.text, "👍🏻");
+    }
+
+    #[test]
+    fn tab_does_nothing_for_an_emoji_without_skin_tones() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run(OPEN_EMOJI_SEARCH);
+
+        // Act
+        simulator.run("{tab}");
+
+        // Assert
+        assert_eq!(emoji_view(&simulator).variant, None);
+    }
+
+    #[test]
+    fn escape_closes_the_skin_tones_and_then_the_emoji_mode() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run(&format!("{OPEN_EMOJI_SEARCH}iine{{tab}}"));
+
+        // Act
+        simulator.run("{esc}");
+        let after_first = emoji_view(&simulator).variant;
+        simulator.run("{esc}");
+
+        // Assert
+        assert_eq!(after_first, None);
+        assert_eq!(simulator.engine.view().mode, Mode::Direct);
+        assert_eq!(simulator.text, "");
+    }
+
+    #[test]
+    fn backspace_on_an_empty_query_leaves_the_emoji_mode() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run(&format!("{OPEN_EMOJI_SEARCH}n"));
+
+        // Act
+        simulator.run("{bs}");
+        let after_first = simulator.engine.view().mode;
+        simulator.run("{bs}");
+
+        // Assert
+        assert_eq!(after_first, Mode::Emoji);
+        assert_eq!(simulator.engine.view().mode, Mode::Direct);
+    }
+
+    #[test]
+    fn typing_with_emoji_search_selected_starts_the_query() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run("emoji  i");
+
+        // Assert
+        assert_eq!(simulator.engine.view().mode, Mode::Emoji);
+        assert_eq!(emoji_view(&simulator).query, "い");
+        assert_eq!(simulator.text, "");
+    }
+
+    #[test]
+    fn eisu_leaves_the_emoji_mode_for_direct_input() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run(OPEN_EMOJI_SEARCH);
+
+        // Act
+        simulator.press(Key::Muhenkan);
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+        assert_eq!(simulator.engine.view().emoji, None);
+    }
+
+    #[test]
+    fn leaving_the_conversion_without_enter_commits_the_word_emoji() {
+        // Arrange: 「絵文字を探す」を選んだ状態
+        let mut focus_change = simulator_with(false);
+        let mut eisu = simulator_with(false);
+        let mut tab = simulator_with(false);
+        for simulator in [&mut focus_change, &mut eisu, &mut tab] {
+            simulator.run("emoji  ");
+        }
+
+        // Act
+        let committed = focus_change.engine.commit_composition();
+        eisu.press(Key::Muhenkan);
+        tab.run("{tab}");
+
+        // Assert: 操作の名前を入力先に出さず、読みも捨てない。
+        assert_eq!(committed, "絵文字");
+        assert_eq!(eisu.text, "絵文字");
+        assert_eq!(tab.text, "絵文字\t");
+        assert_eq!(tab.engine.view().mode, Mode::Direct);
+    }
+
+    #[test]
+    fn emoji_search_is_offered_only_when_emoji_is_the_whole_conversion() {
+        // Arrange
+        let mut sentence = simulator_with(false);
+        let mut resized = simulator_with(false);
+
+        // Act
+        sentence.run("emojinyuuryoku ");
+        resized.run("emoji {sleft}");
+        let after_shrinking = resized.engine.view().candidates;
+        resized.run("{sright}");
+
+        // Assert
+        assert!(!sentence.engine.view().candidates.contains(&"絵文字を探す".to_string()));
+        assert!(!after_shrinking.contains(&"絵文字を探す".to_string()));
+        assert_eq!(resized.engine.view().candidates[1], "絵文字を探す");
+    }
+
+    #[test]
+    fn an_uppercase_letter_with_emoji_search_selected_starts_the_query() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act
+        simulator.run("emoji  C");
+
+        // Assert: 日本語入力から抜けずに、絵文字モードの検索語にする。
+        assert_eq!(simulator.engine.view().mode, Mode::Emoji);
+        assert_eq!(emoji_view(&simulator).query, "c");
+        assert_eq!(simulator.text, "");
     }
 }

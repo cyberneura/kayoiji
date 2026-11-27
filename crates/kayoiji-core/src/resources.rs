@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::converter::Converter;
 use crate::detector::Detector;
 use crate::dict::Dictionary;
+use crate::emoji::Emoji;
 use crate::engine::{Engine, EngineConfig};
 use crate::english::EnglishLexicon;
 use crate::learning::Learning;
@@ -46,7 +47,6 @@ pub fn load_rules(user_rules: &Path) -> (RuleSet, Option<io::Error>) {
 
 /// `data_dir` の辞書を開いてエンジンを作る。
 pub fn open_engine(data_dir: &Path, rules: RuleSet, learning: Learning, config: EngineConfig) -> io::Result<Engine> {
-
     let dictionary_path = data_dir.join(DICTIONARY_FILE);
     let dictionary = Dictionary::open(&dictionary_path).map_err(|error| with_path(&dictionary_path, error))?;
     let english_path = data_dir.join(ENGLISH_FILE);
@@ -54,8 +54,13 @@ pub fn open_engine(data_dir: &Path, rules: RuleSet, learning: Learning, config: 
     let symbols_path = data_dir.join(SYMBOLS_FILE);
     let symbols = Dictionary::open(&symbols_path).map_err(|error| with_path(&symbols_path, error))?;
 
+    let mut converter = Converter::new(Arc::new(dictionary)).with_symbols(Arc::new(symbols));
+    // 絵文字のデータが無い (古い版の `pnpm data` で作った) か読めない時は、絵文字を出さずに動かす。
+    if let Ok(emoji) = Emoji::open(data_dir) {
+        converter = converter.with_emoji(Arc::new(emoji));
+    }
     let detector = Detector::new(
-        Converter::new(Arc::new(dictionary)).with_symbols(Arc::new(symbols)),
+        converter,
         english,
         rules,
         config.detector.clone(),

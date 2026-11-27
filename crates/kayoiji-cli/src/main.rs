@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use kayoiji_core::converter::Converter;
 use kayoiji_core::detector::Context;
 use kayoiji_core::dict::{write_replacing, Dictionary, DictionaryBuilder};
+use kayoiji_core::emoji;
 use kayoiji_core::engine::{Engine, EngineConfig};
 use kayoiji_core::english::EnglishLexicon;
 use kayoiji_core::learning::Learning;
@@ -155,7 +156,9 @@ pub fn read_english_counts(path: &Path) -> io::Result<Vec<(String, u64)>> {
 fn build_data(raw: &Path, output: &Path) -> io::Result<()> {
     fs::create_dir_all(output)?;
 
-    let dictionary = DictionaryBuilder::from_mozc_dir(&raw.join("mozc"))?.build();
+    let mozc = DictionaryBuilder::from_mozc_dir(&raw.join("mozc"))?;
+    build_emoji(raw, output, &mozc)?;
+    let dictionary = mozc.build();
     let dictionary_path = output.join(DICTIONARY_FILE);
     write_replacing(&dictionary_path, &dictionary)?;
     println!("{}: {} bytes", dictionary_path.display(), dictionary.len());
@@ -169,5 +172,25 @@ fn build_data(raw: &Path, output: &Path) -> io::Result<()> {
     let english_path = output.join(ENGLISH_FILE);
     write_replacing(&english_path, &english)?;
     println!("{}: {} bytes", english_path.display(), english.len());
+    Ok(())
+}
+
+/// 絵文字の一覧と索引を作る。漢字を含むキーワードには、Mozc の辞書でその表記の読みを足す。
+fn build_emoji(raw: &Path, output: &Path, mozc: &DictionaryBuilder) -> io::Result<()> {
+    /// 1 つの表記に足す読みの数。コストの小さい方から取る。
+    const READINGS_PER_KEYWORD: usize = 2;
+
+    let source = emoji::Source::parse(
+        &fs::read_to_string(raw.join("emoji/emoji.ja.json"))?,
+        &fs::read_to_string(raw.join("emoji/search-index.json"))?,
+    )?;
+    let readings = mozc.readings_of(&source.kanji_keywords(), READINGS_PER_KEYWORD);
+    let (catalog, index) = source.build(&readings);
+    let catalog_path = output.join(emoji::CATALOG_FILE);
+    write_replacing(&catalog_path, catalog.as_bytes())?;
+    println!("{}: {} bytes", catalog_path.display(), catalog.len());
+    let index_path = output.join(emoji::INDEX_FILE);
+    write_replacing(&index_path, &index)?;
+    println!("{}: {} bytes", index_path.display(), index.len());
     Ok(())
 }

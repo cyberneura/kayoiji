@@ -16,9 +16,23 @@ pub fn to_katakana(text: &str) -> String {
         .collect()
 }
 
+pub fn to_hiragana(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\u{30A1}'..='\u{30F6}' => char::from_u32(c as u32 - 0x60).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hiragana_conversion_keeps_other_characters() {
+        assert_eq!(to_hiragana("ネコとコーヒーヴ猫a"), "ねことこーひーゔ猫a");
+    }
 
     #[test]
     fn katakana_conversion_keeps_other_characters() {

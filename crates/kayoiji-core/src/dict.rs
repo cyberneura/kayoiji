@@ -3,6 +3,7 @@
 //! Mozc の OSS 辞書 (読み・左文脈 ID・右文脈 ID・コスト・表記) と連接コスト行列を
 //! 1 ファイルにまとめる。ファイルは mmap して使うので、起動時に全体を読み込まない。
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::ops::Range;
@@ -16,6 +17,11 @@ use memmap2::Mmap;
 const MAGIC: &[u8; 8] = b"KYJDICT2";
 const HEADER_LEN: usize = 56;
 const ENTRY_LEN: usize = 12;
+
+/// 変体仮名などの、かなの追加の文字 (Kana Supplement と Kana Extended-A)。
+fn is_kana_supplement(c: char) -> bool {
+    ('\u{1B000}'..='\u{1B12F}').contains(&c)
+}
 
 /// Mozc の `id.def` で、未知語に割り当てる品詞。
 const UNKNOWN_POS: &str = "名詞,一般,*,*,*,*,*";
@@ -231,6 +237,22 @@ impl Dictionary {
         self.map.get(reading).and_then(|value| self.entry_range(value))
     }
 
+    /// `prefix` で始まる読みと、そのエントリーの範囲を、読みのバイト順に返す。
+    pub fn prefix_search(&self, prefix: &str) -> Vec<(String, EntryRange)> {
+        use fst::{IntoStreamer, Streamer};
+        let mut found = Vec::new();
+        let mut stream = self.map.range().ge(prefix).into_stream();
+        while let Some((reading, value)) = stream.next() {
+            if !reading.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if let (Ok(reading), Some(range)) = (std::str::from_utf8(reading), self.entry_range(value)) {
+                found.push((reading.to_string(), range));
+            }
+        }
+        found
+    }
+
     /// `text` の先頭に一致する読みをすべて列挙する。コールバックには、一致した長さ
     /// (バイト数) とエントリーの範囲を渡す。
     pub fn common_prefix_search(&self, text: &str, mut visit: impl FnMut(usize, EntryRange)) {
@@ -315,6 +337,29 @@ impl DictionaryBuilder {
         });
     }
 
+    /// `surfaces` のそれぞれの表記の読みを、コストの小さい順に最大 `limit` 個返す。
+    pub fn readings_of(&self, surfaces: &HashSet<String>, limit: usize) -> HashMap<String, Vec<String>> {
+        let mut found: HashMap<&str, Vec<(i16, &str)>> = HashMap::new();
+        for entry in &self.entries {
+            if surfaces.contains(&entry.surface) {
+                found.entry(&entry.surface).or_default().push((entry.cost, &entry.reading));
+            }
+        }
+        found
+            .into_iter()
+            .map(|(surface, mut readings)| {
+                readings.sort();
+                let mut kept: Vec<String> = Vec::new();
+                for (_, reading) in readings {
+                    if kept.len() < limit && !kept.iter().any(|known| known == reading) {
+                        kept.push(reading.to_string());
+                    }
+                }
+                (surface.to_string(), kept)
+            })
+            .collect()
+    }
+
     /// Mozc の `src/data/dictionary_oss` と同じ構成のディレクトリから読み込む。
     pub fn from_mozc_dir(dir: &Path) -> io::Result<Self> {
         let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
@@ -387,6 +432,8 @@ impl DictionaryBuilder {
 
     /// Mozc の記号 (`symbol/symbol.tsv`) と顔文字 (`emoticon/emoticon.tsv`) から、
     /// 読みで記号を引く辞書を作る。候補は元のファイルに並んでいる順に出る。
+    ///
+    /// 変体仮名は取り込まない。macOS のフォントに字形が無く、候補に空の四角が並ぶ (Mozc も既定では出さない)。
     pub fn from_mozc_symbols(dir: &Path) -> io::Result<Self> {
         /// すべての顔文字を出す読み。
         const EMOTICON_READINGS: [&str; 2] = ["かお", "かおもじ"];
@@ -403,6 +450,9 @@ impl DictionaryBuilder {
             let (Some(_pos), Some(surface), Some(readings)) = (fields.next(), fields.next(), fields.next()) else {
                 continue;
             };
+            if surface.chars().any(is_kana_supplement) {
+                continue;
+            }
             for reading in readings.split(' ').filter(|reading| !reading.is_empty()) {
                 add(&mut builder, reading, surface);
             }
@@ -691,6 +741,68 @@ mod tests {
 
         // Assert
         assert_eq!(surfaces, ["→", "⇒", "▶"]);
+    }
+
+    #[test]
+    fn readings_of_a_surface_come_in_cost_order() {
+        // Arrange
+        let mut builder = DictionaryBuilder::lookup_only();
+        builder.add("びょう", 0, 0, 7000, "猫");
+        builder.add("ねこ", 0, 0, 3000, "猫");
+        builder.add("ねこ", 0, 0, 3500, "猫");
+        builder.add("いぬ", 0, 0, 3000, "犬");
+
+        // Act
+        let readings = builder.readings_of(&HashSet::from(["猫".to_string()]), 2);
+
+        // Assert
+        assert_eq!(readings, HashMap::from([("猫".to_string(), vec!["ねこ".to_string(), "びょう".to_string()])]));
+    }
+
+    #[test]
+    fn prefix_search_returns_readings_that_start_with_the_prefix() {
+        // Arrange
+        let mut builder = DictionaryBuilder::lookup_only();
+        for (reading, surface) in [("ねこ", "🐱"), ("ねこぜ", "🙇"), ("ね", "💤"), ("ねる", "😴"), ("のこ", "🪚")] {
+            builder.add(reading, 0, 0, 0, surface);
+        }
+        let dictionary = Dictionary::from_bytes(builder.build()).expect("valid dictionary");
+
+        // Act
+        let found: Vec<String> = dictionary.prefix_search("ねこ").into_iter().map(|(reading, _)| reading).collect();
+
+        // Assert
+        assert_eq!(found, ["ねこ", "ねこぜ"]);
+    }
+
+    #[test]
+    fn hentaigana_are_not_taken_from_the_mozc_symbols() {
+        // Arrange
+        let dir = std::env::temp_dir().join(format!("kayoiji-dict-symbols-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("symbol")).expect("directory");
+        std::fs::create_dir_all(dir.join("emoticon")).expect("directory");
+        std::fs::write(
+            dir.join("symbol/symbol.tsv"),
+            "POS\tCHAR\tREADING\n記号\t𓃠\tひえろぐりふ ねこ\n記号\t𛀙\tへんたいがな き\n記号\t☆\tき ほし\n",
+        )
+        .expect("symbols");
+        std::fs::write(dir.join("emoticon/emoticon.tsv"), "CHAR\tREADING\n").expect("emoticons");
+
+        // Act
+        let dictionary = Dictionary::from_bytes(DictionaryBuilder::from_mozc_symbols(&dir).expect("symbols").build())
+            .expect("valid dictionary");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+
+        // Assert
+        let surfaces = |reading: &str| -> Vec<String> {
+            dictionary
+                .lookup(reading)
+                .map(|range| dictionary.entries(range).map(|entry| entry.surface.to_string()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(surfaces("き"), ["☆"]);
+        assert_eq!(surfaces("へんたいがな"), Vec::<String>::new());
+        assert_eq!(surfaces("ねこ"), ["𓃠"]);
     }
 
     #[test]

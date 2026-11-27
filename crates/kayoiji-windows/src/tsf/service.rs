@@ -228,10 +228,18 @@ impl TextService_Impl {
 
     /// 書き込みを積み、`context` の編集セッションを頼む。打鍵の受け口の中なら `sync` にできる。
     fn apply(&self, context: &ITfContext, edit: Edit, sync: bool) {
+        if self.client_id().is_none() {
+            return;
+        }
+        self.queue.borrow_mut().push_back((context.clone(), edit));
+        self.request_drain(context, sync);
+    }
+
+    /// 積んである書き込みを書く編集セッションを、`context` に頼む。
+    fn request_drain(&self, context: &ITfContext, sync: bool) {
         let Some(client_id) = self.client_id() else {
             return;
         };
-        self.queue.borrow_mut().push_back((context.clone(), edit));
         let service = self.to_object();
         let target = context.clone();
         let session: ITfEditSession = EditSession {
@@ -260,13 +268,20 @@ impl TextService_Impl {
                 }
             };
             let Some((_, edit)) = next else {
-                return Ok(());
+                break;
             };
             match edit {
                 Edit::Output(output) => self.edit(cookie, context, &output)?,
                 Edit::Finish => self.finish(cookie, context)?,
             }
         }
+        // ほかの文書の分が先頭に残った。その文書のために頼んだ編集セッションが先に動いて、何も書かずに
+        // 終わっていることがあるので、もう一度頼む。
+        let blocked = self.queue.borrow().front().map(|(target, _)| target.clone());
+        if let Some(target) = blocked.filter(|target| target != context) {
+            self.request_drain(&target, false);
+        }
+        Ok(())
     }
 
     fn finish(&self, cookie: u32, context: &ITfContext) -> windows_core::Result<()> {
@@ -549,7 +564,9 @@ impl TextService_Impl {
             }
             active.context.clone()
         };
-        if let (Some(context), true) = (context, self.composition.borrow().is_some()) {
+        // 借りたまま apply を呼ばない。編集セッションが同期して動くと、finish が同じ RefCell を借りる。
+        let composing = self.composition.borrow().is_some();
+        if let (Some(context), true) = (context, composing) {
             self.apply(&context, Edit::Finish, false);
         }
     }

@@ -78,15 +78,18 @@ impl Parsed {
         self.segments.iter().any(|segment| !segment.converted)
     }
 
-    /// 先頭から、規則で変換できない英字の手前までの表示と、その後ろの打鍵を返す。
+    /// 末尾の英字の並びで、規則で変換できない英字の手前までの表示と、その後ろの打鍵を返す。
     /// "kyouhast" なら ("きょうは", "st")、"3gatsust" なら ("3がつ", "st")。
     /// 数字や記号は規則に無くても、打ったとおりに表示しているので、かなの側に含める。
     pub fn split_at_unreadable(&self) -> (String, String) {
-        let readable = self
+        // 途中の読めない英字は表示のまま残し、末尾の英字の並びだけを分ける。
+        // "t'i" や "z." のように、規則の途中に英字以外を含むセグメントも、並びの区切りになる。
+        let start = self
             .segments
             .iter()
-            .take_while(|segment| segment.converted || !segment.raw.starts_with(|c: char| c.is_ascii_alphabetic()))
-            .count();
+            .rposition(|segment| segment.raw.contains(|c: char| !c.is_ascii_alphabetic()))
+            .map_or(0, |index| index + 1);
+        let readable = start + self.segments[start..].iter().take_while(|segment| segment.converted).count();
         let kana = self.segments[..readable].iter().map(|s| s.out.as_str()).collect();
         let mut rest: String = self.segments[readable..].iter().map(|s| s.raw.as_str()).collect();
         rest.push_str(&self.pending);

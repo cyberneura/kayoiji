@@ -35,7 +35,7 @@ struct PadState {
     /// 打鍵の時刻の基準。
     started: Instant,
     /// 英文チェックの訂正文と訳を作る補助プロセス。起動できなかった時は `None`。
-    reviewer: Option<Reviewer>,
+    reviewer: Mutex<Option<Reviewer>>,
 }
 
 impl PadState {
@@ -167,9 +167,8 @@ fn pad_spelling(text: String, lookup: bool) -> Spelling {
 /// 言語モデルが使えない時は、その理由をエラーで返す。
 #[tauri::command]
 fn pad_review(state: State<'_, PadState>, id: u64, text: String) -> Result<(), String> {
-    let reviewer = state
-        .reviewer
-        .as_ref()
+    let reviewer = state.reviewer.lock().expect("reviewer lock");
+    let reviewer = reviewer.as_ref()
         .filter(|reviewer| reviewer.is_available())
         .ok_or("この Mac では言語モデルを使えません")?;
     reviewer.request(id, &text);
@@ -205,7 +204,11 @@ fn start_reviewer(app: &App) -> Option<Reviewer> {
     let started = Reviewer::start(&helper, move |event| {
         let sent = match event {
             Event::Review(review) => handle.emit(REVIEW_EVENT, review),
-            Event::Failed { .. } | Event::Unavailable(_) => handle.emit(REVIEW_FAILED_EVENT, ()),
+            Event::Failed { id } => handle.emit(REVIEW_FAILED_EVENT, id),
+            Event::Unavailable(reason) => {
+                eprintln!("kayoiji-pad: the language model is not available: {reason}");
+                Ok(())
+            }
         };
         if let Err(error) = sent {
             eprintln!("kayoiji-pad: could not deliver a review: {error}");
@@ -227,7 +230,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
     app.manage(PadState {
         engine: Mutex::new(engine),
         started: Instant::now(),
-        reviewer: start_reviewer(app),
+        reviewer: Mutex::new(start_reviewer(app)),
     });
     Ok(())
 }
@@ -245,8 +248,14 @@ pub fn run() {
             pad_replace_english,
             pad_system_input_method
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running KayoijiPad");
+        .build(tauri::generate_context!())
+        .expect("error while building KayoijiPad")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                // 通知の関数が持つ AppHandle と管理中の Reviewer の循環を、終了時に切る。
+                app.state::<PadState>().reviewer.lock().expect("reviewer lock").take();
+            }
+        });
 }
 
 #[cfg(test)]

@@ -175,7 +175,7 @@ fn read_answers(stdout: impl BufRead, asked: &Mutex<Option<Asked>>, available: &
     for line in lines {
         let event = {
             let mut asked = asked.lock().expect("asked lock");
-            let current = asked.as_ref().map(|asked| (asked.id, asked.text.clone()));
+            let current = asked.as_ref().filter(|asked| asked.waiting).map(|asked| (asked.id, asked.text.clone()));
             let event = parse_answer(&line, current.as_ref());
             if let (Some(_), Some(asked)) = (&event, asked.as_mut()) {
                 asked.waiting = false;
@@ -186,8 +186,15 @@ fn read_answers(stdout: impl BufRead, asked: &Mutex<Option<Asked>>, available: &
             on_event(event);
         }
     }
-    // 行が尽きたのは、補助プロセスが終わったから。
+    // 行が尽きたのは、補助プロセスが終わったから。待っている依頼は、期限を待たずに失敗にする。
     available.store(false, Ordering::Relaxed);
+    let unanswered = asked.lock().expect("asked lock").as_mut().filter(|asked| asked.waiting).map(|asked| {
+        asked.waiting = false;
+        asked.id
+    });
+    if let Some(id) = unanswered {
+        on_event(Event::Failed { id });
+    }
     on_event(Event::Unavailable("the helper stopped".to_string()));
 }
 
@@ -344,6 +351,25 @@ read line"#;
     }
 
     #[test]
+    fn a_request_left_when_the_helper_stops_fails_at_once() {
+        // Arrange: 依頼を読んだ後、答えずに終わる
+        let script = "echo '{\"available\":true}'\nread line";
+        let (sender, events) = mpsc::channel();
+        let timeout = Duration::from_secs(60);
+        let reviewer = Reviewer::start_with_timeout(&helper("quits", script), timeout, move |event| {
+            let _ = sender.send(event);
+        })
+        .expect("starts");
+
+        // Act
+        reviewer.request(5, "I has a pen");
+
+        // Assert: 期限 (60 秒) を待たずに、依頼の失敗と、補助プロセスが終わったことが届く。
+        assert_eq!(events.recv_timeout(WAIT).expect("a report"), Event::Failed { id: 5 });
+        assert_eq!(events.recv_timeout(WAIT).expect("a report"), Event::Unavailable("the helper stopped".to_string()));
+    }
+
+    #[test]
     fn a_request_without_an_answer_fails_after_the_timeout() {
         // Arrange: 依頼を読むが、答えない補助プロセス
         let script = "echo '{\"available\":true}'\nread line\nsleep 30";
@@ -371,7 +397,8 @@ read line
 echo '{"id":4,"corrected":"I have a pen.","translation":"私はペンを持っています。"}'
 sleep 30"#;
         let (sender, events) = mpsc::channel();
-        let timeout = Duration::from_millis(200);
+        // 期限が短いと、テストを並べて動かした時にシェルの起動が間に合わず、答えより先に期限が切れる。
+        let timeout = Duration::from_secs(1);
         let reviewer = Reviewer::start_with_timeout(&helper("answered", script), timeout, move |event| {
             let _ = sender.send(event);
         })
@@ -383,6 +410,36 @@ sleep 30"#;
         // Assert
         assert!(matches!(events.recv_timeout(WAIT), Ok(Event::Review(_))));
         assert!(events.recv_timeout(timeout * 2).is_err());
+    }
+
+    #[test]
+    fn answers_after_a_timeout_are_dropped() {
+        for answer in [
+            r#"{"id":9,"corrected":"I have a pen."}"#,
+            r#"{"id":9,"error":"late failure"}"#,
+        ] {
+            // Arrange
+            let asked = Mutex::new(Some(Asked {
+                id: 9,
+                text: "I has a pen".to_string(),
+                at: Instant::now(),
+                waiting: false,
+            }));
+            let available = AtomicBool::new(false);
+            let input = format!("{{\"available\":true}}\n{answer}\n");
+            let (sender, events) = mpsc::channel();
+
+            // Act
+            read_answers(input.as_bytes(), &asked, &available, &|event| {
+                sender.send(event).unwrap();
+            });
+
+            // Assert: EOF の知らせだけが届き、期限切れの依頼の結果は届かない。
+            assert_eq!(
+                events.try_iter().collect::<Vec<_>>(),
+                vec![Event::Unavailable("the helper stopped".to_string())]
+            );
+        }
     }
 
     #[test]

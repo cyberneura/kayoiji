@@ -3185,6 +3185,26 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_letters_before_a_separator_keep_the_following_kana() {
+        for (typed, expected) in [
+            ("k,kanast", "k、かなst"),
+            ("desuk.sorehast", "ですk。それはst"),
+            ("ufok?ttd", "うふぉk?っtd"),
+            ("xt'ikanast", "xてぃかなst"),
+        ] {
+            // Arrange
+            let mut simulator = leaving_simulator();
+
+            // Act
+            simulator.run(typed);
+
+            // Assert
+            assert_eq!(simulator.text, expected, "{typed}");
+            assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+        }
+    }
+
+    #[test]
     fn romaji_does_not_leave_japanese_input() {
         // Arrange
         let mut simulator = leaving_simulator();

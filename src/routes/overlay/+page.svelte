@@ -48,6 +48,9 @@
       reviewFailed = false;
     }
     view = next;
+    // 隠した後に届く空の内容では、大きさを報告しない。次の打鍵で表示が求められた後に報告が届くと、
+    // 案内だけのウインドウが一瞬出る。
+    if (next.mode === 'direct' || (next.mode === 'checking' && !next.reading)) return;
     return fit();
   }
 

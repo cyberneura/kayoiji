@@ -19,9 +19,27 @@ pub enum Guesses {
     Lookup,
 }
 
-/// 調べた単語の訂正候補。打っている途中の単語も入るので、この数を超えたら空にする。
+/// 過去の英文から持ち越す訂正候補の数。同じ英文の検査中は、上限を超えても候補を残す。
 const KNOWN_GUESSES: usize = 2000;
-static KNOWN: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(Mutex::default);
+static KNOWN: LazyLock<Mutex<GuessCache>> = LazyLock::new(Mutex::default);
+
+#[derive(Default)]
+struct GuessCache {
+    text: String,
+    words: HashMap<String, Vec<String>>,
+}
+
+impl GuessCache {
+    fn for_text(&mut self, text: &str) -> &mut HashMap<String, Vec<String>> {
+        if self.text != text {
+            if self.words.len() > KNOWN_GUESSES {
+                self.words.clear();
+            }
+            self.text = text.to_string();
+        }
+        &mut self.words
+    }
+}
 
 /// 綴りが誤っている単語と、その訂正候補。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -70,10 +88,8 @@ pub fn misspellings(text: &str, guesses: Guesses) -> (Vec<Misspelling>, bool) {
     let string = NSString::from_str(text);
     let length = string.length();
     let language = ns_string!("en");
-    let mut known = KNOWN.lock().expect("known guesses lock");
-    if known.len() > KNOWN_GUESSES {
-        known.clear();
-    }
+    let mut cache = KNOWN.lock().expect("known guesses lock");
+    let known = cache.for_text(text);
     let mut found = Vec::new();
     let mut pending = false;
     let mut lookups = 0;
@@ -144,6 +160,25 @@ pub fn corrected(text: &str, misspellings: &[Misspelling]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_text_keeps_progress_until_it_changes() {
+        // Arrange
+        let mut cache = GuessCache::default();
+        for index in 0..=KNOWN_GUESSES {
+            cache
+                .for_text("same text")
+                .insert(index.to_string(), vec![]);
+        }
+
+        // Act
+        let kept = cache.for_text("same text").len();
+        let next = cache.for_text("next text").len();
+
+        // Assert
+        assert_eq!(kept, KNOWN_GUESSES + 1);
+        assert_eq!(next, 0);
+    }
 
     fn misspelling(word: &str, start: usize, guesses: &[&str]) -> Misspelling {
         Misspelling {

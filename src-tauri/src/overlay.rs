@@ -74,7 +74,9 @@ pub fn update(app: &AppHandle, view: View, anchor: Option<Rect>) -> tauri::Resul
     *overlay.latest.lock().expect("overlay lock") = view.clone();
     if is_hidden(&view) {
         overlay.wanted.store(false, Ordering::Relaxed);
-        return window.hide();
+        // 空の内容も渡す。候補ウインドウは前の英文と比べて、訂正文と訳を残すかを決めている。
+        window.hide()?;
+        return app.emit_to(LABEL, VIEW_EVENT, &view);
     }
     overlay.wanted.store(true, Ordering::Relaxed);
     if anchor.is_some() {
@@ -86,12 +88,13 @@ pub fn update(app: &AppHandle, view: View, anchor: Option<Rect>) -> tauri::Resul
 /// 候補ウインドウを隠す。`view` は確定した後の内容で、確定した文字列を最後の内容として残さないために置き換える。
 pub fn hide(app: &AppHandle, view: View) -> tauri::Result<()> {
     let overlay = app.state::<Overlay>();
-    *overlay.latest.lock().expect("overlay lock") = view;
+    *overlay.latest.lock().expect("overlay lock") = view.clone();
     overlay.wanted.store(false, Ordering::Relaxed);
-    match app.get_webview_window(LABEL) {
-        Some(window) => window.hide(),
-        None => Ok(()),
-    }
+    let Some(window) = app.get_webview_window(LABEL) else {
+        return Ok(());
+    };
+    window.hide()?;
+    app.emit_to(LABEL, VIEW_EVENT, &view)
 }
 
 /// 未確定文字列の下に置く。画面の下端からはみ出す時は上に置く。

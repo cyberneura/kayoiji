@@ -6,9 +6,14 @@
 //! 入力先の文書は、編集セッション (`ITfEditSession`) の中でしか書き換えられない。TSF は、こちらが
 //! 呼び出した編集の途中で、こちらのメソッド (`OnCompositionTerminated` など) を呼び返すことがあるので、
 //! 状態の `RefCell` を借りたまま TSF を呼ばない。
+//!
+//! 打鍵は OnTestKeyDown でエンジンに渡して、使うかどうかを決める。IMM32 を経由するアプリは、OnTestKeyDown で
+//! 使うと答えたキーを VK_PROCESSKEY に置き換えるので、続く OnKeyDown で使わないと答えても、キーはアプリに届かない。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Instant;
 
 use kayoiji_core::engine::{Engine, InputMode, Key, Output};
@@ -18,16 +23,21 @@ use kayoiji_core::settings::Settings;
 use windows::Win32::Foundation::{LPARAM, MAX_PATH, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Variant::VARIANT;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetKeyboardState, MapVirtualKeyW, ToUnicode, MAPVK_VK_TO_VSC};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, GetKeyboardState, MapVirtualKeyW, SendInput, ToUnicode, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+};
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl,
     ITfCompartmentMgr, ITfContext, ITfContextComposition, ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl,
-    ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfSource, ITfTextInputProcessor,
-    ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
-    ITfThreadMgrEventSink_Impl, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
-    TF_AE_NONE, TF_ANCHOR_END, TF_CONVERSIONMODE_FULLSHAPE, TF_CONVERSIONMODE_NATIVE, TF_ES_ASYNCDONTCARE,
-    TF_ES_READWRITE, TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
+    ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfSource,
+    ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
+    ITfThreadMgrEventSink_Impl, ITfTextInputProcessorEx, GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+    GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, TF_AE_NONE, TF_ANCHOR_END, TF_CONTEXT_EDIT_CONTEXT_FLAGS,
+    TF_CONVERSIONMODE_FULLSHAPE, TF_CONVERSIONMODE_NATIVE, TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo;
 use windows_core::{implement, IUnknownImpl, Interface, Ref, BOOL, GUID};
 
 use crate::keys::{self, KeyStroke, Mapped};
@@ -35,6 +45,9 @@ use crate::panel::panel;
 
 use super::module;
 use super::window::CandidateWindow;
+
+/// 確定してからキーを通すために送り直したキーの目印 (`dwExtraInfo`)。送り直したキーは、エンジンに渡さずに通す。
+const RESENT: usize = 0x4B59_4A49;
 
 /// 有効になっている間の状態。
 struct Active {
@@ -45,23 +58,60 @@ struct Active {
     /// 辞書が開けない時は `None`。その時は打鍵をすべて入力先に通す。
     engine: Option<Engine>,
     started: Instant,
-    composition: Option<ITfComposition>,
     /// 最後に打鍵を受けた文書。打鍵の間隔のタイマーが切れた時に、そこへ反映する。
     context: Option<ITfContext>,
     window: Option<CandidateWindow>,
     /// 入力モードの compartment を、自分で書き換えている最中かどうか。その変更の知らせは無視する。
     setting_compartment: bool,
+    /// OnTestKeyDown でエンジンに渡した打鍵の結果。続く OnKeyDown で文書に反映する。
+    decided: Option<Decision>,
+}
+
+/// 打鍵をエンジンに渡した結果。
+struct Decision {
+    wparam: usize,
+    lparam: isize,
+    /// 入力先に反映する出力。キーを入力先に通す時は `None`。
+    output: Option<Output>,
+    mode_changed: bool,
+    /// 確定を書いた後に、入力先に通すために送り直すキー。
+    resend: Option<u16>,
+}
+
+impl Decision {
+    fn eaten(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn is_for(&self, wparam: WPARAM, lparam: LPARAM) -> bool {
+        self.wparam == wparam.0 && self.lparam == lparam.0
+    }
+}
+
+/// 文書への 1 回の書き込み。
+enum Edit {
+    Output(Output),
+    /// 表示している未確定文字列を、書き直さずに終わらせる (入力先が切り替わる時)。
+    Finish,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfCompositionSink, ITfThreadMgrEventSink, ITfCompartmentEventSink)]
 pub struct TextService {
     active: RefCell<Option<Active>>,
+    /// 今の未確定文字列。無効にされた後に動く編集セッションでも使うので、`Active` の外に持つ。
+    composition: RefCell<Option<ITfComposition>>,
+    /// 文書に書いていない書き込み。編集セッションは、TSF の都合で後から動くことも、後に頼んだものが先に
+    /// 動くこともある (同期のものは、待っている非同期のものより先に動く)。書き込みは順に積み、動いた
+    /// 編集セッションが前から順に書く。
+    queue: RefCell<VecDeque<(ITfContext, Edit)>>,
 }
 
 impl TextService {
     pub fn new() -> Self {
         Self {
             active: RefCell::new(None),
+            composition: RefCell::new(None),
+            queue: RefCell::new(VecDeque::new()),
         }
     }
 }
@@ -142,6 +192,10 @@ impl TextService_Impl {
         active.started.elapsed().as_millis() as u64
     }
 
+    fn client_id(&self) -> Option<u32> {
+        self.active.borrow().as_ref().map(|active| active.client_id)
+    }
+
     /// エンジンの入力モードを、OS の入力モードの表示 (タスクバーの「あ」「A」) に合わせる。
     fn sync_compartment(&self) {
         let (thread_manager, client_id, open) = {
@@ -172,30 +226,71 @@ impl TextService_Impl {
         }
     }
 
-    /// エンジンの出力を、`context` の文書に反映する。
-    fn apply(&self, context: &ITfContext, output: Output) {
-        let Some(client_id) = self.active.borrow().as_ref().map(|active| active.client_id) else {
+    /// 書き込みを積み、`context` の編集セッションを頼む。打鍵の受け口の中なら `sync` にできる。
+    fn apply(&self, context: &ITfContext, edit: Edit, sync: bool) {
+        let Some(client_id) = self.client_id() else {
             return;
         };
+        self.queue.borrow_mut().push_back((context.clone(), edit));
         let service = self.to_object();
         let target = context.clone();
         let session: ITfEditSession = EditSession {
-            action: Box::new(move |cookie| service.edit(cookie, &target, &output)),
+            action: Box::new(move |cookie| service.drain(cookie, &target)),
         }
         .into();
-        // SAFETY: 読み書きの編集セッションを頼む。できるなら、この呼び出しの中で同期して動く。
-        let _ = unsafe { context.RequestEditSession(client_id, &session, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE) };
+        let request = |flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS| {
+            // SAFETY: 読み書きの編集セッションを頼む。
+            unsafe { context.RequestEditSession(client_id, &session, flags | TF_ES_READWRITE) }
+                .is_ok_and(|result| result.is_ok())
+        };
+        if !(sync && request(TF_ES_SYNC)) {
+            request(TF_ES_ASYNCDONTCARE);
+        }
+    }
+
+    /// 積んである書き込みのうち、`context` の分を前から順に書く。ほかの文書の分が先頭に来たら、その文書の
+    /// 編集セッションに任せる。
+    fn drain(&self, cookie: u32, context: &ITfContext) -> windows_core::Result<()> {
+        loop {
+            let next = {
+                let mut queue = self.queue.borrow_mut();
+                match queue.front() {
+                    Some((target, _)) if target == context => queue.pop_front(),
+                    _ => None,
+                }
+            };
+            let Some((_, edit)) = next else {
+                return Ok(());
+            };
+            match edit {
+                Edit::Output(output) => self.edit(cookie, context, &output)?,
+                Edit::Finish => self.finish(cookie, context)?,
+            }
+        }
+    }
+
+    fn finish(&self, cookie: u32, context: &ITfContext) -> windows_core::Result<()> {
+        let Some(composition) = self.composition.borrow_mut().take() else {
+            return Ok(());
+        };
+        // SAFETY: 編集セッションの中で、未確定文字列の後ろにキャレットを置いてから終わらせる。
+        unsafe {
+            if let Ok(range) = composition.GetRange() {
+                range.Collapse(cookie, TF_ANCHOR_END)?;
+                set_caret(cookie, context, &range)?;
+            }
+            composition.EndComposition(cookie)
+        }
     }
 
     /// 編集セッションの中で、確定と未確定文字列を書き、候補ウインドウを動かす。
     fn edit(&self, cookie: u32, context: &ITfContext, output: &Output) -> windows_core::Result<()> {
-        let composition = self.active.borrow().as_ref().and_then(|active| active.composition.clone());
+        let mut composition = self.composition.borrow_mut().take();
         // SAFETY: 編集セッションの中なので、`cookie` で文書を読み書きできる。
         unsafe {
-            if !output.reread.is_empty() {
-                remove_before_caret(cookie, context, composition.as_ref(), &output.reread)?;
+            if !output.reread.is_empty() && composition.is_none() {
+                remove_before_caret(cookie, context, &output.reread)?;
             }
-            let mut composition = composition;
             if !output.commit.is_empty() || output.preedit.is_empty() {
                 let range = match &composition {
                     Some(composition) => composition.GetRange()?,
@@ -213,7 +308,7 @@ impl TextService_Impl {
             }
             let mut anchor = None;
             if !output.preedit.is_empty() {
-                let composition = match composition {
+                let started = match composition {
                     Some(composition) => composition,
                     None => {
                         let range =
@@ -222,7 +317,7 @@ impl TextService_Impl {
                         context.cast::<ITfContextComposition>()?.StartComposition(cookie, &range, &sink)?
                     }
                 };
-                let range = composition.GetRange()?;
+                let range = started.GetRange()?;
                 let text: Vec<u16> = output.preedit.encode_utf16().collect();
                 range.SetText(cookie, 0, &text)?;
                 let caret = range.Clone()?;
@@ -233,11 +328,7 @@ impl TextService_Impl {
                 if context.GetActiveView()?.GetTextExt(cookie, &range, &mut rect, &mut clipped).is_ok() {
                     anchor = Some(rect);
                 }
-                if let Some(active) = self.active.borrow_mut().as_mut() {
-                    active.composition = Some(composition);
-                }
-            } else if let Some(active) = self.active.borrow_mut().as_mut() {
-                active.composition = None;
+                *self.composition.borrow_mut() = Some(started);
             }
             if anchor.is_none() {
                 anchor = caret_rect(cookie, context);
@@ -288,26 +379,52 @@ impl TextService_Impl {
             };
             (engine.handle_timeout(now), context)
         };
-        self.apply(&context, output);
+        self.apply(&context, Edit::Output(output), false);
         self.schedule_timeout();
     }
 
-    /// 打鍵をエンジンに渡すかどうか。渡さない打鍵は、TSF が入力先に通す。
-    fn wants(&self, wparam: WPARAM, lparam: LPARAM) -> bool {
-        let active = self.active.borrow();
-        let Some(engine) = active.as_ref().and_then(|active| active.engine.as_ref()) else {
+    /// 打鍵をエンジンに渡して、使うかどうかを決める。使う打鍵の結果は、続く OnKeyDown のために取っておく。
+    fn decide(&self, context: &ITfContext, wparam: WPARAM, lparam: LPARAM) -> bool {
+        // SAFETY: 今の打鍵のメッセージに付いた値を読む。
+        if unsafe { GetMessageExtraInfo() }.0 as usize == RESENT {
             return false;
-        };
-        match keys::translate(key_stroke(wparam, lparam), engine.view().mode) {
-            Mapped::Modifier => false,
-            Mapped::Toggle => true,
-            Mapped::Engine(Key::Henkan | Key::Muhenkan) => true,
-            Mapped::Engine(_) => engine.input_mode() != InputMode::Direct,
         }
-    }
-
-    fn key_down(&self, context: &ITfContext, wparam: WPARAM, lparam: LPARAM) -> bool {
-        let output = {
+        let earlier = {
+            let mut active = self.active.borrow_mut();
+            let Some(active) = active.as_mut() else {
+                return false;
+            };
+            // TSF は同じ打鍵の OnTestKeyDown を 2 度呼ぶことがある。
+            if let Some(decision) = active.decided.as_ref().filter(|decision| decision.is_for(wparam, lparam)) {
+                return decision.eaten();
+            }
+            active.decided.take()
+        };
+        // 使うと答えたのに OnKeyDown が来なかった打鍵。結果を捨てると入力が欠けるので、ここで反映する。
+        if let Some(earlier) = earlier {
+            self.perform(context, earlier);
+        }
+        let stroke = key_stroke(wparam, lparam);
+        let (key, target) = {
+            let active = self.active.borrow();
+            let Some(engine) = active.as_ref().and_then(|active| active.engine.as_ref()) else {
+                return false;
+            };
+            let key = match keys::translate(stroke, engine.view().mode) {
+                Mapped::Modifier => return false,
+                Mapped::Toggle if engine.input_mode() == InputMode::Direct => Key::Henkan,
+                Mapped::Toggle => Key::Muhenkan,
+                Mapped::Engine(key) => key,
+            };
+            let target = if key == Key::ForceJapanese { engine.reread_target() } else { String::new() };
+            (key, target)
+        };
+        // 確定済みの単語の読み直しは、その単語がキャレットの直前にある時だけ行う。無ければエンジンに渡さない。
+        // 渡すと、単語を日本語として覚えた上に、未確定文字列がその時のキャレットの位置に入る。
+        if !target.is_empty() && !self.precedes_caret(context, &target) {
+            return false;
+        }
+        let decision = {
             let mut active = self.active.borrow_mut();
             let Some(active) = active.as_mut() else {
                 return false;
@@ -317,39 +434,112 @@ impl TextService_Impl {
             let Some(engine) = active.engine.as_mut() else {
                 return false;
             };
-            let key = match keys::translate(key_stroke(wparam, lparam), engine.view().mode) {
-                Mapped::Modifier => return false,
-                Mapped::Toggle if engine.input_mode() == InputMode::Direct => Key::Henkan,
-                Mapped::Toggle => Key::Muhenkan,
-                Mapped::Engine(key) => key,
-            };
-            if engine.input_mode() == InputMode::Direct && !matches!(key, Key::Henkan) {
-                return false;
-            }
             let was_direct = engine.input_mode() == InputMode::Direct;
-            let output = engine.handle(key, now);
-            (output, was_direct != (engine.input_mode() == InputMode::Direct))
+            let preedit = engine.preedit();
+            let mut output = engine.handle(key, now);
+            let mode_changed = was_direct != (engine.input_mode() == InputMode::Direct);
+            let writes = !output.commit.is_empty() || !output.reread.is_empty() || output.preedit != preedit;
+            let mut resend = None;
+            let output = if output.consumed {
+                Some(output)
+            } else if !writes {
+                None
+            } else {
+                // 確定してからキーを入力先に通す。文字と空白は確定する文字列の後ろに足し、ほかのキーは
+                // 確定を書いた後に送り直す。
+                match key {
+                    Key::Space => output.commit.push(' '),
+                    Key::Char(c) => output.commit.push(c),
+                    _ => resend = Some(stroke.vk),
+                }
+                output.consumed = true;
+                Some(output)
+            };
+            Decision {
+                wparam: wparam.0,
+                lparam: lparam.0,
+                output,
+                mode_changed,
+                resend,
+            }
         };
-        let (output, mode_changed) = output;
-        let consumed = output.consumed;
-        self.apply(context, output);
-        if mode_changed {
+        if !decision.eaten() {
+            if decision.mode_changed {
+                self.sync_compartment();
+            }
+            self.schedule_timeout();
+            return false;
+        }
+        if let Some(active) = self.active.borrow_mut().as_mut() {
+            active.decided = Some(decision);
+        }
+        true
+    }
+
+    fn key_down(&self, context: &ITfContext, wparam: WPARAM, lparam: LPARAM) -> bool {
+        let take = || {
+            self.active.borrow_mut().as_mut().and_then(|active| {
+                active
+                    .decided
+                    .take_if(|decision| decision.is_for(wparam, lparam))
+            })
+        };
+        let decision = match take() {
+            Some(decision) => decision,
+            None if self.decide(context, wparam, lparam) => match take() {
+                Some(decision) => decision,
+                None => return false,
+            },
+            None => return false,
+        };
+        self.perform(context, decision);
+        true
+    }
+
+    fn perform(&self, context: &ITfContext, decision: Decision) {
+        if let Some(output) = decision.output {
+            self.apply(context, Edit::Output(output), true);
+        }
+        if decision.mode_changed {
             self.sync_compartment();
         }
         self.schedule_timeout();
-        consumed
+        if let Some(vk) = decision.resend {
+            resend(vk);
+        }
+    }
+
+    /// `text` がキャレットの直前にあり、選択範囲が無いかどうか。読み取りの編集セッションで同期して調べる。
+    fn precedes_caret(&self, context: &ITfContext, text: &str) -> bool {
+        let Some(client_id) = self.client_id() else {
+            return false;
+        };
+        let found = Rc::new(Cell::new(false));
+        let result = Rc::clone(&found);
+        let target = context.clone();
+        let expected: Vec<u16> = text.encode_utf16().collect();
+        let session: ITfEditSession = EditSession {
+            action: Box::new(move |cookie| {
+                // SAFETY: 読み取りの編集セッションの中で調べる。
+                result.set(unsafe { text_before_caret(cookie, &target, expected.len()) }.is_ok_and(|text| text == expected));
+                Ok(())
+            }),
+        }
+        .into();
+        // SAFETY: 打鍵の受け口の中なので、同期の読み取りの編集セッションを頼める。
+        let requested = unsafe { context.RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READ) };
+        requested.is_ok_and(|result| result.is_ok()) && found.get()
     }
 
     /// 未確定文字列を表示のとおりに確定する。入力先が切り替わる時と、無効にされる時に呼ぶ。
-    ///
     /// 入力先の文書には、表示している文字列がそのまま入っているので、書き直さずに未確定文字列を終わらせる。
-    /// 編集セッションは後から動くことがあるので、終わらせる未確定文字列はここで取り出して渡す。
     fn commit_all(&self) {
-        let (composition, context, client_id) = {
+        let context = {
             let mut active = self.active.borrow_mut();
             let Some(active) = active.as_mut() else {
                 return;
             };
+            active.decided = None;
             if let Some(engine) = active.engine.as_mut() {
                 engine.commit_composition();
             }
@@ -357,31 +547,18 @@ impl TextService_Impl {
                 window.hide();
                 window.cancel_timer();
             }
-            (active.composition.take(), active.context.clone(), active.client_id)
+            active.context.clone()
         };
-        let (Some(composition), Some(context)) = (composition, context) else {
-            return;
-        };
-        let session: ITfEditSession = EditSession {
-            action: Box::new(move |cookie| {
-                // SAFETY: 編集セッションの中で、未確定文字列の範囲の後ろにキャレットを置いてから終わらせる。
-                unsafe {
-                    if let Ok(range) = composition.GetRange() {
-                        let _ = range.Collapse(cookie, TF_ANCHOR_END);
-                    }
-                    composition.EndComposition(cookie)
-                }
-            }),
+        if let (Some(context), true) = (context, self.composition.borrow().is_some()) {
+            self.apply(&context, Edit::Finish, false);
         }
-        .into();
-        // SAFETY: 読み書きの編集セッションを頼む。
-        let _ = unsafe { context.RequestEditSession(client_id, &session, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE) };
     }
 
     fn advise(&self, thread_manager: &ITfThreadMgr, client_id: u32) -> windows_core::Result<(u32, u32)> {
-        let key_sink: ITfKeyEventSink = self.to_object().to_interface();
-        let thread_sink: ITfThreadMgrEventSink = self.to_object().to_interface();
-        let compartment_sink: ITfCompartmentEventSink = self.to_object().to_interface();
+        let service = self.to_object();
+        let key_sink: ITfKeyEventSink = service.to_interface();
+        let thread_sink: ITfThreadMgrEventSink = service.to_interface();
+        let compartment_sink: ITfCompartmentEventSink = service.to_interface();
         // SAFETY: 有効にされたスレッドのマネージャーに、このオブジェクトの受け口を登録する。
         unsafe {
             thread_manager.cast::<ITfKeystrokeMgr>()?.AdviseKeyEventSink(client_id, &key_sink, true)?;
@@ -396,27 +573,55 @@ impl TextService_Impl {
     }
 }
 
-/// 確定済みの文字列のうち、キャレットの直前の `text` を消す (Ctrl+J の読み直し)。直前の文字列が
-/// `text` と違う時は、利用者がキャレットを動かしたので、何もしない。
-unsafe fn remove_before_caret(
-    cookie: u32,
-    context: &ITfContext,
-    composition: Option<&ITfComposition>,
-    text: &str,
-) -> windows_core::Result<()> {
-    if composition.is_some() {
-        return Ok(());
-    }
-    let expected: Vec<u16> = text.encode_utf16().collect();
+/// 確定の後に、キーを入力先に送り直す。目印を付けて、エンジンには渡さない。
+fn resend(vk: u16) {
+    let extended = matches!(vk, 0x21..=0x28 | 0x2D | 0x2E);
+    let event = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: 0,
+                dwFlags: KEYBD_EVENT_FLAGS(
+                    if extended { KEYEVENTF_EXTENDEDKEY.0 } else { 0 } | if up { KEYEVENTF_KEYUP.0 } else { 0 },
+                ),
+                time: 0,
+                dwExtraInfo: RESENT,
+            },
+        },
+    };
+    // SAFETY: 押して離すキーの入力を 2 つ送る。
+    unsafe { SendInput(&[event(false), event(true)], std::mem::size_of::<INPUT>() as i32) };
+}
+
+/// 選択範囲が無い時の、キャレットの直前の `length` 単位 (UTF-16) の文字列。選択範囲がある時はエラー。
+unsafe fn text_before_caret(cookie: u32, context: &ITfContext, length: usize) -> windows_core::Result<Vec<u16>> {
     // SAFETY: 呼び出し元は編集セッションの中。
     unsafe {
         let range = context.cast::<ITfInsertAtSelection>()?.InsertTextAtSelection(cookie, TF_IAS_QUERYONLY, &[])?;
+        if !range.IsEmpty(cookie)?.as_bool() {
+            return Err(windows::Win32::Foundation::E_FAIL.into());
+        }
         let mut moved = 0;
-        range.ShiftStart(cookie, -(expected.len() as i32), &mut moved, std::ptr::null())?;
-        let mut buffer = vec![0u16; expected.len()];
-        let mut length = 0;
-        range.GetText(cookie, 0, &mut buffer, &mut length)?;
-        if buffer[..length as usize] == expected[..] {
+        range.ShiftStart(cookie, -(length as i32), &mut moved, std::ptr::null())?;
+        let mut buffer = vec![0u16; length];
+        let mut fetched = 0;
+        range.GetText(cookie, 0, &mut buffer, &mut fetched)?;
+        buffer.truncate(fetched as usize);
+        Ok(buffer)
+    }
+}
+
+/// 確定済みの文字列のうち、キャレットの直前の `text` を消す (Ctrl+J の読み直し)。直前の文字列が
+/// `text` と違う時と、選択範囲がある時は、利用者がキャレットを動かしたので、何もしない。
+unsafe fn remove_before_caret(cookie: u32, context: &ITfContext, text: &str) -> windows_core::Result<()> {
+    let expected: Vec<u16> = text.encode_utf16().collect();
+    // SAFETY: 呼び出し元は編集セッションの中。
+    unsafe {
+        if text_before_caret(cookie, context, expected.len()).is_ok_and(|found| found == expected) {
+            let range = context.cast::<ITfInsertAtSelection>()?.InsertTextAtSelection(cookie, TF_IAS_QUERYONLY, &[])?;
+            let mut moved = 0;
+            range.ShiftStart(cookie, -(expected.len() as i32), &mut moved, std::ptr::null())?;
             range.SetText(cookie, 0, &[])?;
         }
     }
@@ -496,10 +701,10 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
             compartment_sink: None,
             engine: open(),
             started: Instant::now(),
-            composition: None,
             context: None,
             window: CandidateWindow::new(),
             setting_compartment: false,
+            decided: None,
         });
         let (thread_sink, compartment_sink) = self.advise(&thread_manager, client_id)?;
         if let Some(active) = self.active.borrow_mut().as_mut() {
@@ -512,12 +717,20 @@ impl ITfTextInputProcessorEx_Impl for TextService_Impl {
 }
 
 impl ITfKeyEventSink_Impl for TextService_Impl {
-    fn OnSetFocus(&self, _foreground: BOOL) -> windows_core::Result<()> {
+    /// キーボードのフォーカスを失ったら、未確定文字列を確定して候補ウインドウを隠す。候補ウインドウは
+    /// 最前面に出しているので、残すとほかのアプリの上に出たままになる。
+    fn OnSetFocus(&self, foreground: BOOL) -> windows_core::Result<()> {
+        if !foreground.as_bool() {
+            self.commit_all();
+        }
         Ok(())
     }
 
-    fn OnTestKeyDown(&self, _context: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> windows_core::Result<BOOL> {
-        Ok(self.wants(wparam, lparam).into())
+    fn OnTestKeyDown(&self, context: Ref<ITfContext>, wparam: WPARAM, lparam: LPARAM) -> windows_core::Result<BOOL> {
+        let Some(context) = context.as_ref() else {
+            return Ok(false.into());
+        };
+        Ok(self.decide(context, wparam, lparam).into())
     }
 
     fn OnTestKeyUp(&self, _context: Ref<ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> windows_core::Result<BOOL> {
@@ -543,8 +756,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
 impl ITfCompositionSink_Impl for TextService_Impl {
     /// 入力先が未確定文字列を終わらせた (クリックなど)。表示していた文字列は、入力先に確定されたまま残る。
     fn OnCompositionTerminated(&self, _cookie: u32, _composition: Ref<ITfComposition>) -> windows_core::Result<()> {
+        self.composition.borrow_mut().take();
         if let Some(active) = self.active.borrow_mut().as_mut() {
-            active.composition = None;
+            active.decided = None;
             if let Some(engine) = active.engine.as_mut() {
                 engine.commit_composition();
             }
@@ -620,8 +834,11 @@ impl ITfCompartmentEventSink_Impl for TextService_Impl {
         // SAFETY: フォーカスのある文書の、いちばん上のコンテキストに反映する。
         let context = unsafe { thread_manager.GetFocus().and_then(|document| document.GetTop()) };
         if let Ok(context) = context {
-            self.apply(&context, output);
+            self.apply(&context, Edit::Output(output), false);
         }
+        // 開閉に合わせて、変換モード (「あ」か「A」か) も書き直す。開いた時に変換モードが半角英数のまま残ると、
+        // 日本語入力なのにタスクバーには「A」が出る。
+        self.sync_compartment();
         Ok(())
     }
 }
@@ -635,10 +852,4 @@ impl ITfEditSession_Impl for EditSession_Impl {
     fn DoEditSession(&self, cookie: u32) -> windows_core::Result<()> {
         (self.action)(cookie)
     }
-}
-
-// ITfTextInputProcessor は ITfTextInputProcessorEx の基底。QueryInterface で両方を返せるように使う。
-#[allow(dead_code)]
-fn _base_interface(processor: &ITfTextInputProcessorEx) -> windows_core::Result<ITfTextInputProcessor> {
-    processor.cast()
 }

@@ -18,6 +18,7 @@ Unicode true
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "x64.nsh"
+!include "FileFunc.nsh"
 
 !define REGKEY "Software\Kayoiji"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Kayoiji"
@@ -63,15 +64,18 @@ FunctionEnd
 
 Section "Install"
   ReadRegStr $1 HKLM "${REGKEY}" "InstalledDir"
-  ReadRegStr $3 HKLM "${REGKEY}" "InstalledVersion"
-  ; 前に入れ替えた時に、この版のフォルダーを次のログオンで消すように登録していたら取り消す
-  ; (入れ替えた後、ログオンし直す前に、前の版を入れ直した時)。
-  DeleteRegValue HKLM "${RUNONCE}" "KayoijiRemove${VERSION}"
-  ${If} $1 != ""
-    !insertmacro Unregister "$1"
-  ${EndIf}
 
-  StrCpy $2 "$INSTDIR\${VERSION}"
+  ; まだ無い名前のフォルダーに入れる。同じ版を入れ直す時や、まだ読み込まれている前の版に戻す時は、
+  ; そのフォルダーの DLL を上書きできないので、"<版>-2" のように別の名前にする。
+  StrCpy $4 "${VERSION}"
+  StrCpy $5 1
+  ${DoWhile} ${FileExists} "$INSTDIR\$4\*.*"
+    IntOp $5 $5 + 1
+    StrCpy $4 "${VERSION}-$5"
+  ${Loop}
+  StrCpy $2 "$INSTDIR\$4"
+
+  ; 先にファイルを置く。置けなかった時は、前の版の登録をそのまま残す。
   SetOutPath "$2"
   File "/oname=kayoiji-x64.dll" "${SOURCE}\x64\kayoiji_windows.dll"
   File "/oname=kayoiji-x86.dll" "${SOURCE}\x86\kayoiji_windows.dll"
@@ -80,6 +84,9 @@ Section "Install"
   SetOutPath "$2\data"
   File "${SOURCE}\data\*.*"
 
+  ${If} $1 != ""
+    !insertmacro Unregister "$1"
+  ${EndIf}
   ExecWait '"${REGSVR32_64}" /s "$2\kayoiji-x64.dll"' $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "64 bit の DLL を登録できませんでした (regsvr32 の終了コード $0)。"
@@ -93,15 +100,14 @@ Section "Install"
 
   ; 前の版のフォルダーは、次にログオンする時に丸ごと消す。前の版を読み込んだアプリは、テキストサービスを
   ; 有効にし直すたびに隣の辞書を開くので、使われていないファイルだけを今消すと、そのアプリで打てなくなる。
-  ; 登録の名前は消すフォルダーの版にして、その版を入れ直した時に取り消せるようにする。
+  ; 登録の名前はフォルダーの名前にする。フォルダーの名前は入れるたびに違うので、今の版のフォルダーは消されない。
   ${If} $1 != ""
   ${AndIf} $1 != $2
-  ${AndIf} $3 != ""
-    WriteRegStr HKLM "${RUNONCE}" "KayoijiRemove$3" '"$SYSDIR\cmd.exe" /c rmdir /s /q "$1"'
+    ${GetFileName} "$1" $6
+    WriteRegStr HKLM "${RUNONCE}" "KayoijiRemove$6" '"$SYSDIR\cmd.exe" /c rmdir /s /q "$1"'
   ${EndIf}
 
   WriteRegStr HKLM "${REGKEY}" "InstalledDir" "$2"
-  WriteRegStr HKLM "${REGKEY}" "InstalledVersion" "${VERSION}"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "Kayoiji"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"

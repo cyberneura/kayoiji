@@ -95,8 +95,9 @@ pnpm pad                     # KayoijiPad を開発モードで起動する
 - Windows 版 (`crates/kayoiji-windows/src/tsf`) は、macOS でも `cargo check -p kayoiji-windows --target x86_64-pc-windows-msvc`
   で型を検査できる (リンクはできない)。ビルドとテストは `.github/workflows/windows.yml` の Windows の runner で行う。
   TSF は編集セッションの途中でこちらのメソッドを呼び返すことがあるので、状態の `RefCell` を借りたまま TSF を呼ばない
-- Windows 版のインストーラー (`installer/windows/kayoiji.nsi`) は、版ごとのフォルダーに DLL と辞書を入れて登録し直す。
-  入力方式の DLL は動いているアプリが読み込んだまま放さないので、同じ場所には上書きできない。リリースでは
+- Windows 版のインストーラー (`installer/windows/kayoiji.nsi`) は、まだ無い名前の版ごとのフォルダー (同じ版を入れ直す時は
+  `<版>-2`) に DLL と辞書を置いてから、登録し直す。入力方式の DLL は動いているアプリが読み込んだまま放さないので、
+  同じ場所には上書きできない。前の版のフォルダーは、次のログオンの時に RunOnce で丸ごと消す。リリースでは
   `release.yml` の `build-windows` が作って Release に添付する。Windows 版の依存のライセンスは `THIRD-PARTY-NOTICES-windows.txt`
   (`pnpm notices` が作る。直接の依存が載っていないと `kayoiji-windows` のテストが落ちる)
 - リリースは `.github/workflows/release.yml` が行う。main の版 (`Cargo.toml` の workspace、`package.json`、

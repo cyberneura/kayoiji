@@ -1,7 +1,7 @@
 //! 利用者の選択の記録。変換で選んだ表記、区切り直して確定した語、英語・日本語の判定の訂正を覚える。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,35 @@ struct Phrase {
     words: Vec<(String, String)>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// 文節で選んだ表記のうち、残すもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retain {
+    /// この表記だけを残す。
+    Equal(String),
+    /// この文字列を含む表記だけを残す。
+    Containing(String),
+}
+
+impl Retain {
+    fn keeps(&self, surface: &str) -> bool {
+        match self {
+            Retain::Equal(kept) => surface == kept,
+            Retain::Containing(part) => surface.contains(part.as_str()),
+        }
+    }
+}
+
+/// 記録への 1 回の変更。保存する時に、ほかのプロセスが書いた内容に重ね直す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Change {
+    Conversion { reading: String, surface: String },
+    RetainConversions { reading: String, retain: Retain },
+    Phrase(Phrase),
+    ForgetPhrase(String),
+    Language { word: String, language: Language, in_flow: bool },
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Learning {
     /// 読みごとの、選ばれた表記。新しく選んだものが先頭。
     #[serde(default)]
@@ -41,9 +69,12 @@ pub struct Learning {
     japanese_words: BTreeSet<String>,
     #[serde(skip)]
     path: Option<PathBuf>,
-    /// 保存に失敗して、ファイルに書けていない変更があるかどうか。次に記録する時に保存し直す。
+    /// ファイルに書けていない変更。保存に失敗したら残し、次に記録する時に保存し直す。
     #[serde(skip)]
-    unsaved: bool,
+    pending: Vec<Change>,
+    /// 保存の時に読み直した、ほかのプロセスの記録で、覚えた語か英語・日本語の訂正が変わったかどうか。
+    #[serde(skip)]
+    outside_changes: bool,
 }
 
 impl Learning {
@@ -133,98 +164,175 @@ impl Learning {
     }
 
     pub fn record_conversion(&mut self, reading: &str, surface: &str) -> io::Result<()> {
-        let surfaces = self.conversions.entry(reading.to_string()).or_default();
-        if surfaces.first().is_none_or(|first| first != surface) {
-            surfaces.retain(|known| known != surface);
-            surfaces.insert(0, surface.to_string());
-            surfaces.truncate(SURFACES_PER_READING);
-            self.unsaved = true;
-        }
-        self.save()
+        self.record(Change::Conversion {
+            reading: reading.to_string(),
+            surface: surface.to_string(),
+        })
     }
 
-    /// `reading` の文節で選んだ表記のうち、`keep` が false を返すものを忘れる。
-    pub fn retain_conversions(&mut self, reading: &str, keep: impl Fn(&str) -> bool) -> io::Result<()> {
-        if let Some(surfaces) = self.conversions.get_mut(reading) {
-            let count = surfaces.len();
-            surfaces.retain(|surface| keep(surface));
-            self.unsaved |= surfaces.len() != count;
-            if surfaces.is_empty() {
-                self.conversions.remove(reading);
-            }
-        }
-        self.save()
+    /// `reading` の文節で選んだ表記のうち、`retain` に当たらないものを忘れる。
+    pub fn retain_conversions(&mut self, reading: &str, retain: Retain) -> io::Result<()> {
+        self.record(Change::RetainConversions {
+            reading: reading.to_string(),
+            retain,
+        })
     }
 
     /// 辞書の語の並びを、1 語として覚える。
     pub fn record_phrase(&mut self, words: &[(String, String)]) -> io::Result<()> {
-        let phrase = Phrase {
+        self.record(Change::Phrase(Phrase {
             reading: words.iter().map(|(reading, _)| reading.as_str()).collect(),
             surface: words.iter().map(|(_, surface)| surface.as_str()).collect(),
             words: words.to_vec(),
-        };
-        if self.phrases.first() != Some(&phrase) {
-            self.phrases.retain(|known| known.reading != phrase.reading);
-            self.phrases.insert(0, phrase);
-            self.phrases.truncate(PHRASES);
-            self.unsaved = true;
-        }
-        self.save()
+        }))
     }
 
     /// 覚えた語を忘れる。その語を使って確定した文節の表記も忘れる。残すと、助詞を付けて
     /// 確定したことのある読みでは、忘れた語が先頭に出続ける。
     pub fn forget_phrase(&mut self, reading: &str) -> io::Result<()> {
-        let Some(index) = self.phrases.iter().position(|known| known.reading == reading) else {
-            return self.save();
-        };
-        let phrase = self.phrases.remove(index);
-        for (known, surfaces) in &mut self.conversions {
-            if known != reading && known.contains(reading) {
-                surfaces.retain(|surface| !surface.contains(&phrase.surface));
-            }
-        }
-        self.conversions.retain(|_, surfaces| !surfaces.is_empty());
-        self.unsaved = true;
-        self.save()
+        self.record(Change::ForgetPhrase(reading.to_string()))
     }
 
     pub fn record_language(&mut self, word: &str, language: Language, in_flow: bool) -> io::Result<()> {
-        let changed = match language {
-            Language::English => {
-                let forgotten = self.japanese_words.remove(word);
-                let learned = self.english_words.insert(word.to_string());
-                let learned_in_flow = in_flow && self.flow_english_words.insert(word.to_string());
-                forgotten || learned || learned_in_flow
-            }
-            Language::Japanese => {
-                let forgotten = self.english_words.remove(word);
-                let forgotten_in_flow = self.flow_english_words.remove(word);
-                let learned = self.japanese_words.insert(word.to_string());
-                forgotten || forgotten_in_flow || learned
-            }
-        };
-        self.unsaved |= changed;
+        self.record(Change::Language {
+            word: word.to_string(),
+            language,
+            in_flow,
+        })
+    }
+
+    /// 保存の時に、ほかのプロセスの記録で、覚えた語 (`phrases`) か英語・日本語の訂正 (`languages`) が
+    /// 変わったかどうかを返し、知らせを消す。変わっていたら、変換器と判定器に覚えさせ直す。
+    pub fn take_outside_changes(&mut self) -> bool {
+        std::mem::take(&mut self.outside_changes)
+    }
+
+    /// 変更を記録に適用して保存する。手元の記録で変わらなくても積む。ほかのプロセスが先に別の表記を
+    /// 選んで保存していれば、ファイルの記録では変わる。
+    fn record(&mut self, change: Change) -> io::Result<()> {
+        self.apply(&change);
+        self.pending.push(change);
         self.save()
     }
 
+    /// 変更を適用して、記録が変わったかどうかを返す。同じ変更を 2 度適用しても、結果は 1 度と同じ。
+    fn apply(&mut self, change: &Change) -> bool {
+        match change {
+            Change::Conversion { reading, surface } => {
+                // 区切り直して覚えた語と違う表記を選んだら、その語は忘れる。ほかのプロセスが覚えた語にも
+                // 効くように、保存の時に読み直した記録に重ねる時もここで忘れる。
+                let conflicting = self.phrase(reading).is_some_and(|known| known != surface);
+                let forgotten = conflicting && self.apply(&Change::ForgetPhrase(reading.clone()));
+                let surfaces = self.conversions.entry(reading.clone()).or_default();
+                if surfaces.first() == Some(surface) {
+                    return forgotten;
+                }
+                surfaces.retain(|known| known != surface);
+                surfaces.insert(0, surface.clone());
+                surfaces.truncate(SURFACES_PER_READING);
+                true
+            }
+            Change::RetainConversions { reading, retain } => {
+                let Some(known) = self.conversions.get_mut(reading) else {
+                    return false;
+                };
+                let count = known.len();
+                known.retain(|surface| retain.keeps(surface));
+                let changed = known.len() != count;
+                if known.is_empty() {
+                    self.conversions.remove(reading);
+                }
+                changed
+            }
+            Change::Phrase(phrase) => {
+                if self.phrases.first() == Some(phrase) {
+                    return false;
+                }
+                self.phrases.retain(|known| known.reading != phrase.reading);
+                self.phrases.insert(0, phrase.clone());
+                self.phrases.truncate(PHRASES);
+                true
+            }
+            Change::ForgetPhrase(reading) => {
+                let Some(index) = self.phrases.iter().position(|known| &known.reading == reading) else {
+                    return false;
+                };
+                let phrase = self.phrases.remove(index);
+                for (known, surfaces) in &mut self.conversions {
+                    if known != reading && known.contains(reading.as_str()) {
+                        surfaces.retain(|surface| !surface.contains(&phrase.surface));
+                    }
+                }
+                self.conversions.retain(|_, surfaces| !surfaces.is_empty());
+                true
+            }
+            Change::Language { word, language, in_flow } => match language {
+                Language::English => {
+                    let forgotten = self.japanese_words.remove(word);
+                    let learned = self.english_words.insert(word.clone());
+                    let learned_in_flow = *in_flow && self.flow_english_words.insert(word.clone());
+                    forgotten || learned || learned_in_flow
+                }
+                Language::Japanese => {
+                    let forgotten = self.english_words.remove(word);
+                    let forgotten_in_flow = self.flow_english_words.remove(word);
+                    let learned = self.japanese_words.insert(word.clone());
+                    forgotten || forgotten_in_flow || learned
+                }
+            },
+        }
+    }
+
     /// 書けていない変更があれば保存する。
+    ///
+    /// 同じファイルに書くプロセスは 1 つとは限らない (Windows の入力メソッドは入力先のプロセスごとに動き、
+    /// macOS でも入力メソッドと KayoijiPad が同時に動く)。ファイル全体を書き直すと、ほかのプロセスが
+    /// 覚えた分が消えるので、ロックを取ってから読み直し、その上にこのプロセスの変更を重ねて書く。
     fn save(&mut self) -> io::Result<()> {
-        if !self.unsaved {
+        if self.pending.is_empty() {
             return Ok(());
         }
-        let Some(path) = &self.path else {
-            self.unsaved = false;
+        let Some(path) = self.path.clone() else {
+            self.pending.clear();
             return Ok(());
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // 書き込みの途中で終了しても、元のファイルが壊れないようにする。
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(self).expect("learning serializes"))?;
-        fs::rename(&temporary, path)?;
-        self.unsaved = false;
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("json.lock"))?;
+        lock.lock()?;
+        let (mut merged, mut changed) = match fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Learning>(&text) {
+                Ok(saved) => (saved, false),
+                // 読めない内容に重ねることはできないので、このプロセスの記録で置き換える。
+                Err(_) => (self.clone(), true),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (Learning::default(), false),
+            Err(error) => return Err(error),
+        };
+        for change in &self.pending {
+            changed |= merged.apply(change);
+        }
+        if changed {
+            // 書き込みの途中で終了しても、元のファイルが壊れないようにする。
+            let temporary = path.with_extension("json.tmp");
+            fs::write(&temporary, serde_json::to_vec_pretty(&merged).expect("learning serializes"))?;
+            fs::rename(&temporary, &path)?;
+        }
+        self.outside_changes |= merged.phrases != self.phrases
+            || merged.english_words != self.english_words
+            || merged.flow_english_words != self.flow_english_words
+            || merged.japanese_words != self.japanese_words;
+        self.conversions = merged.conversions;
+        self.phrases = merged.phrases;
+        self.english_words = merged.english_words;
+        self.flow_english_words = merged.flow_english_words;
+        self.japanese_words = merged.japanese_words;
+        self.pending.clear();
         Ok(())
     }
 }
@@ -341,7 +449,7 @@ mod tests {
         // Act
         let readings = learning.readings_containing("かよいじ");
         learning
-            .retain_conversions("かよいじを", |surface| surface.contains("通い路"))
+            .retain_conversions("かよいじを", Retain::Containing("通い路".to_string()))
             .expect("saved");
 
         // Assert
@@ -441,6 +549,82 @@ mod tests {
             "{ not json"
         );
         assert_eq!(Learning::load(&path).expect("new record").conversions("あめ"), ["飴"]);
+    }
+
+    #[test]
+    fn records_from_two_processes_are_both_kept() {
+        // Arrange: 同じファイルを、2 つのプロセスが別々に読み込んでいる
+        let path = temporary_file("two-processes");
+        let mut first = Learning::load(&path).expect("missing file is an empty record");
+        let mut second = Learning::load(&path).expect("missing file is an empty record");
+
+        // Act
+        first.record_conversion("あめ", "飴").expect("saved");
+        second.record_phrase(&words(&[("かよい", "通い"), ("じ", "路")])).expect("saved");
+        second.record_language("made", Language::English, false).expect("saved");
+
+        // Assert: 後から保存した側も、先に保存された分を消さない。読み直した分は、記録にも入る。
+        let saved = Learning::load(&path).expect("saved file loads");
+        assert_eq!(saved.conversions("あめ"), ["飴"]);
+        assert_eq!(saved.phrase("かよいじ"), Some("通い路"));
+        assert_eq!(second.conversions("あめ"), ["飴"]);
+        assert!(first.phrase("かよいじ").is_none());
+        // 変換の選択は記録から直接引くが、語と訂正は変換器と判定器に覚えさせ直す必要がある。
+        assert!(!first.take_outside_changes());
+        first.record_conversion("はれ", "晴れ").expect("saved");
+        assert!(first.take_outside_changes());
+        assert!(!first.take_outside_changes());
+    }
+
+    #[test]
+    fn choosing_again_what_this_process_already_has_first_still_wins_over_another_process() {
+        // Arrange: 両方のプロセスが「飴」を先頭に持っていて、もう一方が「雨」を選んで保存した
+        let path = temporary_file("choose-again");
+        Learning::load(&path).expect("empty").record_conversion("あめ", "飴").expect("saved");
+        let mut first = Learning::load(&path).expect("loads");
+        Learning::load(&path).expect("loads").record_conversion("あめ", "雨").expect("saved");
+
+        // Act: 手元では先頭のままの「飴」を、選び直す
+        first.record_conversion("あめ", "飴").expect("saved");
+
+        // Assert
+        assert_eq!(Learning::load(&path).expect("loads").conversions("あめ"), ["飴", "雨"]);
+        assert_eq!(first.conversions("あめ"), ["飴", "雨"]);
+    }
+
+    #[test]
+    fn a_choice_forgets_a_conflicting_phrase_learned_by_another_process() {
+        // Arrange: このプロセスが読み込んだ後に、もう一方が「はめ → 歯目」を語として覚えた
+        let path = temporary_file("conflicting-phrase");
+        let mut first = Learning::load(&path).expect("empty");
+        Learning::load(&path)
+            .expect("empty")
+            .record_phrase(&words(&[("は", "歯"), ("め", "目")]))
+            .expect("saved");
+
+        // Act
+        first.record_conversion("はめ", "羽目").expect("saved");
+
+        // Assert: 後から選んだ「羽目」が勝ち、もう一方の語は読み込まれない。
+        assert_eq!(Learning::load(&path).expect("loads").phrase("はめ"), None);
+        assert_eq!(first.phrase("はめ"), None);
+        assert!(!first.take_outside_changes());
+    }
+
+    #[test]
+    fn retaining_conversions_also_applies_to_choices_of_another_process() {
+        // Arrange: このプロセスが読み込んだ後に、もう一方が「かよいじを」で「通地を」を選んだ
+        let path = temporary_file("retain-outside");
+        let mut first = Learning::load(&path).expect("empty");
+        Learning::load(&path).expect("empty").record_conversion("かよいじを", "通地を").expect("saved");
+
+        // Act
+        first
+            .retain_conversions("かよいじを", Retain::Containing("通い路".to_string()))
+            .expect("saved");
+
+        // Assert
+        assert!(Learning::load(&path).expect("loads").conversions("かよいじを").is_empty());
     }
 
     #[test]

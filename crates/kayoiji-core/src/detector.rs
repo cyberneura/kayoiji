@@ -147,6 +147,19 @@ impl Detector {
         self.config = config;
     }
 
+    /// 覚えた訂正を忘れて、判断データベースの単語だけにする。学習の記録から覚えさせ直す前に呼ぶ。
+    pub fn forget_learned(&mut self) {
+        self.english_words.clear();
+        self.flow_english_words.clear();
+        self.japanese_words.clear();
+        for (word, language) in self.rules.words() {
+            match language {
+                Language::English => self.english_words.insert(word.to_string()),
+                Language::Japanese => self.japanese_words.insert(word.to_string()),
+            };
+        }
+    }
+
     /// 利用者の訂正を覚える。後から覚えた方を優先する。
     /// `in_flow` は、日本語の入力が続いている間に行われた訂正かどうか。
     pub fn learn(&mut self, word: &str, language: Language, in_flow: bool) {

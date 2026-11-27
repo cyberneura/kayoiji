@@ -13,4 +13,5 @@ pub mod learning;
 pub mod resources;
 pub mod romaji;
 pub mod rules;
+pub mod settings;
 pub mod simulate;

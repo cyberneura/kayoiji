@@ -5,7 +5,6 @@ mod input_source;
 #[cfg(target_os = "macos")]
 mod keys;
 mod overlay;
-mod settings;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -19,7 +18,7 @@ use tauri::path::BaseDirectory;
 use tauri::{App, AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 
 use overlay::Overlay;
-use settings::Settings;
+use kayoiji_core::settings::Settings;
 
 const SETTINGS_WINDOW: &str = "settings";
 const ABOUT_WINDOW: &str = "about";

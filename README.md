@@ -276,6 +276,32 @@ MIT ([LICENSE](LICENSE))。同梱する第三者のライブラリと辞書・�
 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) にある (アプリの `Contents/Resources` にも入っている)。
 データの出典は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
+## Windows 版 (開発中)
+
+Windows の入力方式 (TSF のテキストサービス) として動く版を、`crates/kayoiji-windows` で作っている。
+変換、学習、自動切り替え、日本語入力から自動で抜ける設定は macOS 版と同じ。英文チェックは無い
+(macOS のスペルチェッカーと言語モデルを使うため)。インストーラーはまだ無いので、次の手順で入れる。
+
+1. `pnpm data` で辞書を作る (Git Bash などの bash で動かす)
+2. `cargo build --release -p kayoiji-windows --target x86_64-pc-windows-msvc` と、32 bit のアプリ用に
+   `--target i686-pc-windows-msvc` でも DLL を作る
+3. 1 つのフォルダーに DLL を置き、その下の `data` に `data/build` の辞書 (`kayoiji.dict`、`english.fst`、`symbols.dict`、
+   `emoji.dict`、`emoji.json`) を置く。32 bit の DLL は名前を変えて同じフォルダーに置いてよい
+4. 管理者の権限で `regsvr32 kayoiji_windows.dll` (32 bit の DLL は `%SystemRoot%\SysWOW64\regsvr32.exe` で) を実行する
+5. 「設定 → 時刻と言語 → 言語と地域 → 日本語 → 言語のオプション → キーボードの追加」で Kayoiji を追加する
+
+外す時は `regsvr32 /u kayoiji_windows.dll`。
+
+| キー | 動作 |
+|---|---|
+| 変換 / カタカナ ひらがな | 日本語入力にする (自動切り替えが有効なら、自動切り替えにする) |
+| 無変換 | 直接入力にする (タスクバーの表示が「A」になる) |
+| 半角/全角 | 日本語入力と直接入力を入れ替える |
+
+ほかのキーは macOS 版と同じ (上のキー操作の表)。設定、判断データベース、学習は `%APPDATA%\Kayoiji` の
+`settings.toml`、`rules.toml`、`learning.json`。設定画面はまだ無いので、`settings.toml` を直接書く
+(`auto_switch = true` で自動切り替え)。
+
 ## KayoijiPad
 
 エンジンを、入力メソッドとして入れずに試すためのアプリ。テキストエリアとコピーボタンだけがある。
@@ -323,6 +349,7 @@ cargo run --release -p kayoiji-cli -- evaluate                        # 実デ�
 | `crates/kayoiji-check` | 英文チェックの部品。綴りの検査と、言語モデルの補助プロセスの呼び出し |
 | `helper/english-check.swift` | 英文チェックの補助プロセス。Mac の言語モデルに訂正文と訳を頼む |
 | `crates/kayoiji-cli` | 辞書のビルド、ターミナルからの動作確認、精度の評価 |
+| `crates/kayoiji-windows` | Windows 版。TSF のテキストサービスの DLL (`tsf`)、キーの読み替え (`keys.rs`)、候補ウインドウの内容 (`panel.rs`) |
 | `src-tauri` | Tauri アプリ。InputMethodKit との接続 (`imk.rs`)、候補ウインドウ、設定 |
 | `src-tauri/Info.plist` | 入力メソッドとして OS に認識させるための設定 |
 | `pad/src-tauri` | KayoijiPad。エンジンを試すためのテキストエリアのアプリ |

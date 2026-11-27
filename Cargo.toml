@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/kayoiji-core", "crates/kayoiji-check", "crates/kayoiji-cli", "src-tauri", "pad/src-tauri"]
+members = ["crates/kayoiji-core", "crates/kayoiji-check", "crates/kayoiji-cli", "crates/kayoiji-windows", "src-tauri", "pad/src-tauri"]
 
 [workspace.package]
-version = "0.6.3"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 publish = false

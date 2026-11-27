@@ -62,6 +62,9 @@ pub struct EngineConfig {
     /// 英語を打ち始めたとみなすのは、大文字の英字と、ローマ字の規則に無い並び ("st", "pl")。
     /// "thi" (てぃ) のように規則にある並びと、その途中 ("th") は、日本語のままにする。
     pub leave_japanese_for_english: bool,
+    /// 「かな」を続けて 2 度押すと、英文チェック (`InputMode::English`) に入る。英文チェックの綴りの検査と
+    /// 訂正文は OS の機能 (macOS のスペルチェッカーと言語モデル) で作るので、それが無い OS では切る。
+    pub english_check: bool,
     pub detector: DetectorConfig,
 }
 
@@ -73,6 +76,7 @@ impl Default for EngineConfig {
             english_words_to_leave_japanese: 2,
             auto_switch: false,
             leave_japanese_for_english: false,
+            english_check: true,
             detector: DetectorConfig::default(),
         }
     }
@@ -683,7 +687,10 @@ impl Engine {
         }
         // 2 度押しを数えるのは、何も入力していない時の「かな」だけ。自動切り替えでは、入力中の「かな」は
         // 変換と次の候補に使うので、続けて押すのが普通の操作になる。
-        let counts = key == Key::Henkan && self.input_mode != InputMode::English && self.preedit().is_empty();
+        let counts = key == Key::Henkan
+            && self.config.english_check
+            && self.input_mode != InputMode::English
+            && self.preedit().is_empty();
         if !counts {
             // 間にほかのキーを挟んだ「かな」は、続けて 2 度押したことにしない。
             self.last_henkan_ms = None;
@@ -4198,5 +4205,24 @@ mod tests {
         assert_eq!(simulator.engine.view().mode, Mode::Emoji);
         assert_eq!(emoji_view(&simulator).query, "c");
         assert_eq!(simulator.text, "");
+    }
+
+    #[test]
+    fn kana_twice_does_not_enter_the_english_check_when_it_is_off() {
+        // Arrange
+        let mut simulator = Simulator::new(Engine::new(
+            sample_detector(),
+            Learning::in_memory(),
+            EngineConfig {
+                english_check: false,
+                ..EngineConfig::default()
+            },
+        ));
+
+        // Act
+        simulator.run("{henkan}{henkan}");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
     }
 }

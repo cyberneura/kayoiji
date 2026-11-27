@@ -455,6 +455,11 @@ impl Converter {
         self.phrases.words.remove(reading);
     }
 
+    /// 覚えた語をすべて忘れる。学習の記録から覚えさせ直す前に呼ぶ。
+    pub fn forget_phrases(&mut self) {
+        self.phrases.words.clear();
+    }
+
     /// `reading` を `surface` に変換する経路を、辞書の語の並びで返す。
     /// 辞書の語だけで作れない表記 (ひらがなのまま、カタカナ、記号、日付) には `None` を返す。
     pub fn words(&self, reading: &str, surface: &str) -> Option<Vec<Word>> {

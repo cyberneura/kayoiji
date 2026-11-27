@@ -1540,11 +1540,31 @@ impl Engine {
         self.state = State::Direct(Direct::after_commit());
     }
 
-    fn learn_language(&mut self, word: &str, language: Language, in_flow: bool) {
-        self.detector.learn(word, language, in_flow);
-        if let Err(error) = self.learning.record_language(word, language, in_flow) {
+    /// 学習の保存の結果を受け取る。保存の時にほかのプロセスの記録を読み込んで、覚えた語か訂正が
+    /// 変わっていたら、変換器と判定器に覚えさせ直す。覚えさせ直さないと、ほかのプロセスで忘れた語が
+    /// このプロセスの変換に残り続ける。
+    fn learning_saved(&mut self, saved: io::Result<()>) {
+        if let Err(error) = saved {
             self.last_error = Some(error);
         }
+        if !self.learning.take_outside_changes() {
+            return;
+        }
+        self.detector.forget_learned();
+        for (word, language, in_flow) in self.learning.languages() {
+            self.detector.learn(word, language, in_flow);
+        }
+        let converter = self.detector.converter_mut();
+        converter.forget_phrases();
+        for words in self.learning.phrases() {
+            converter.learn_phrase(words);
+        }
+    }
+
+    fn learn_language(&mut self, word: &str, language: Language, in_flow: bool) {
+        self.detector.learn(word, language, in_flow);
+        let saved = self.learning.record_language(word, language, in_flow);
+        self.learning_saved(saved);
     }
 
     fn learn_conversion(&mut self, reading: &str, surface: &str) {
@@ -1553,16 +1573,14 @@ impl Engine {
         if self.learning.phrase(reading).is_some_and(|known| known != surface) {
             self.forget_phrase(reading);
         }
-        if let Err(error) = self.learning.record_conversion(reading, surface) {
-            self.last_error = Some(error);
-        }
+        let saved = self.learning.record_conversion(reading, surface);
+        self.learning_saved(saved);
     }
 
     fn forget_phrase(&mut self, reading: &str) {
         self.detector.converter_mut().forget_phrase(reading);
-        if let Err(error) = self.learning.forget_phrase(reading) {
-            self.last_error = Some(error);
-        }
+        let saved = self.learning.forget_phrase(reading);
+        self.learning_saved(saved);
     }
 
     /// 利用者が区切り直して確定した範囲 (文節ごとの読みと表記) を、1 語として覚える。
@@ -1612,15 +1630,13 @@ impl Engine {
         if !self.detector.converter_mut().learn_phrase(&words) {
             return;
         }
-        if let Err(error) = self.learning.record_phrase(&words) {
-            self.last_error = Some(error);
-        }
+        let saved = self.learning.record_phrase(&words);
+        self.learning_saved(saved);
         // 同じ読みの文節で以前に選んだ表記は忘れる。残すと、語より先に出る。
         // ここで語の表記を文節の選択として記録することはしない。「ゆきが」を「雪賀」と覚えた時に
         // 記録すると、「雪が積もる」の文節「ゆきが」まで「雪賀」になる。
-        if let Err(error) = self.learning.retain_conversions(&reading, |chosen| chosen == surface) {
-            self.last_error = Some(error);
-        }
+        let saved = self.learning.retain_conversions(&reading, |chosen| chosen == surface);
+        self.learning_saved(saved);
         // この語を含む読みで以前に選んだ表記が残っていると、助詞が付いた読みでは、語を覚える前の
         // 選択が先頭に出続ける。変換にこの語が使われる読みに限って、語を使っていない選択を忘れる。
         for known in self.learning.readings_containing(&reading) {
@@ -1633,9 +1649,8 @@ impl Engine {
             if !uses_phrase {
                 continue;
             }
-            if let Err(error) = self.learning.retain_conversions(&known, |chosen| chosen.contains(&surface)) {
-                self.last_error = Some(error);
-            }
+            let saved = self.learning.retain_conversions(&known, |chosen| chosen.contains(&surface));
+            self.learning_saved(saved);
         }
     }
 }
@@ -2316,6 +2331,32 @@ mod tests {
         // Assert
         // 「京」は辞書の 1 語なので、語としては覚えない。覚えると、「きょう」を含む変換がどれも変わる。
         assert_eq!(simulator.engine.learning.phrases().count(), 0);
+    }
+
+    #[test]
+    fn a_phrase_forgotten_by_another_process_is_forgotten_here_on_the_next_save() {
+        // Arrange: 別のプロセスが覚えた語を、このプロセスも起動時に読み込んでいる
+        let path = std::env::temp_dir().join(format!("kayoiji-engine-{}-shared", std::process::id())).join("learning.json");
+        let _ = std::fs::remove_dir_all(path.parent().expect("has parent"));
+        Learning::load(&path)
+            .expect("empty")
+            .record_phrase(&words(&[("は", "歯"), ("め", "目")]))
+            .expect("saved");
+        let mut simulator = Simulator::new(Engine::new(
+            sample_detector(),
+            Learning::load(&path).expect("loads"),
+            EngineConfig::default(),
+        ));
+        simulator.run("hamega \n");
+        assert_eq!(simulator.text, "歯目が");
+        Learning::load(&path).expect("loads").forget_phrase("はめ").expect("saved");
+
+        // Act: このプロセスで別の文を確定して、学習を保存する
+        simulator.clear();
+        simulator.run("ame \nhamega ");
+
+        // Assert
+        assert_eq!(simulator.text, "雨羽目が");
     }
 
     #[test]

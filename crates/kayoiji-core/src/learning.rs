@@ -54,6 +54,9 @@ pub struct Learning {
     /// ファイルに書けていない変更。保存に失敗したら残し、次に記録する時に保存し直す。
     #[serde(skip)]
     pending: Vec<Change>,
+    /// 保存の時に読み直した、ほかのプロセスの記録で、覚えた語か英語・日本語の訂正が変わったかどうか。
+    #[serde(skip)]
+    outside_changes: bool,
 }
 
 impl Learning {
@@ -186,6 +189,12 @@ impl Learning {
         })
     }
 
+    /// 保存の時に、ほかのプロセスの記録で、覚えた語 (`phrases`) か英語・日本語の訂正 (`languages`) が
+    /// 変わったかどうかを返し、知らせを消す。変わっていたら、変換器と判定器に覚えさせ直す。
+    pub fn take_outside_changes(&mut self) -> bool {
+        std::mem::take(&mut self.outside_changes)
+    }
+
     /// 変更を記録に適用し、変わったら保存する。
     fn record(&mut self, change: Change) -> io::Result<()> {
         if self.apply(&change) {
@@ -293,6 +302,10 @@ impl Learning {
         let temporary = path.with_extension("json.tmp");
         fs::write(&temporary, serde_json::to_vec_pretty(&merged).expect("learning serializes"))?;
         fs::rename(&temporary, &path)?;
+        self.outside_changes |= merged.phrases != self.phrases
+            || merged.english_words != self.english_words
+            || merged.flow_english_words != self.flow_english_words
+            || merged.japanese_words != self.japanese_words;
         self.conversions = merged.conversions;
         self.phrases = merged.phrases;
         self.english_words = merged.english_words;
@@ -535,6 +548,11 @@ mod tests {
         assert_eq!(saved.phrase("かよいじ"), Some("通い路"));
         assert_eq!(second.conversions("あめ"), ["飴"]);
         assert!(first.phrase("かよいじ").is_none());
+        // 変換の選択は記録から直接引くが、語と訂正は変換器と判定器に覚えさせ直す必要がある。
+        assert!(!first.take_outside_changes());
+        first.record_conversion("はれ", "晴れ").expect("saved");
+        assert!(first.take_outside_changes());
+        assert!(!first.take_outside_changes());
     }
 
     #[test]

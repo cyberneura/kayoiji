@@ -97,6 +97,8 @@ enum Edit {
     Finish,
     /// 文書は変えずに、候補ウインドウだけを今の表示内容にする (絵文字モードを抜けてキーを通した時など)。
     Refresh,
+    /// 確定してから入力先に通すキーを送り直す。前の書き込みが済んでから送らないと、確定より先にキーが届く。
+    Resend(u16),
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfCompositionSink, ITfThreadMgrEventSink, ITfCompartmentEventSink)]
@@ -239,10 +241,40 @@ impl TextService_Impl {
         self.request_drain(context, sync);
     }
 
-    /// 積んである書き込みを書く編集セッションを、`context` に頼む。
+    /// 積んである書き込みを書く編集セッションを、`context` に頼む。頼めない (文書が入力先から外された) 時は、
+    /// その文書の分を列から外す。残すと、後ろに積んだほかの文書の分まで書かれなくなる。
     fn request_drain(&self, context: &ITfContext, sync: bool) {
+        if !self.request_session(context, sync) {
+            self.retire(context);
+        }
+    }
+
+    /// `context` の書き込みを列から外し、次に先頭になった文書の編集セッションを頼む。
+    fn retire(&self, context: &ITfContext) {
+        let composition = self.composition.borrow().clone();
+        // SAFETY: 未確定文字列の範囲が、どの文書のものかを読む。
+        let belongs = composition.is_some_and(|composition| unsafe {
+            composition
+                .GetRange()
+                .and_then(|range| range.GetContext())
+                .is_ok_and(|owner| &owner == context)
+        });
+        if belongs {
+            self.composition.borrow_mut().take();
+        }
+        let next = {
+            let mut queue = self.queue.borrow_mut();
+            queue.retain(|(target, _)| target != context);
+            queue.front().map(|(target, _)| target.clone())
+        };
+        if let Some(next) = next {
+            self.request_drain(&next, false);
+        }
+    }
+
+    fn request_session(&self, context: &ITfContext, sync: bool) -> bool {
         let Some(client_id) = self.client_id() else {
-            return;
+            return false;
         };
         let service = self.to_object();
         let target = context.clone();
@@ -255,9 +287,7 @@ impl TextService_Impl {
             unsafe { context.RequestEditSession(client_id, &session, flags | TF_ES_READWRITE) }
                 .is_ok_and(|result| result.is_ok())
         };
-        if !(sync && request(TF_ES_SYNC)) {
-            request(TF_ES_ASYNCDONTCARE);
-        }
+        (sync && request(TF_ES_SYNC)) || request(TF_ES_ASYNCDONTCARE)
     }
 
     /// 積んである書き込みのうち、`context` の分を前から順に書く。ほかの文書の分が先頭に来たら、その文書の
@@ -279,6 +309,7 @@ impl TextService_Impl {
                 Edit::Finish => self.finish(cookie, context)?,
                 // SAFETY: 編集セッションの中で、未確定文字列かキャレットの位置を読む。
                 Edit::Refresh => unsafe { self.refresh(cookie, context) },
+                Edit::Resend(vk) => resend(vk),
             }
         }
         // ほかの文書の分が先頭に残った。その文書のために頼んだ編集セッションが先に動いて、何も書かずに
@@ -546,13 +577,13 @@ impl TextService_Impl {
         if let Some(output) = decision.output {
             self.apply(context, Edit::Output(output), true);
         }
+        if let Some(vk) = decision.resend {
+            self.apply(context, Edit::Resend(vk), true);
+        }
         if decision.mode_changed {
             self.sync_compartment();
         }
         self.schedule_timeout();
-        if let Some(vk) = decision.resend {
-            resend(vk);
-        }
     }
 
     /// `text` がキャレットの直前にあり、選択範囲が無いかどうか。読み取りの編集セッションで同期して調べる。
@@ -838,7 +869,11 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         Ok(())
     }
 
-    fn OnPopContext(&self, _context: Ref<ITfContext>) -> windows_core::Result<()> {
+    /// 文書が入力先から外された。その文書への書き込みは、もう書けない。
+    fn OnPopContext(&self, context: Ref<ITfContext>) -> windows_core::Result<()> {
+        if let Some(context) = context.as_ref() {
+            self.retire(context);
+        }
         Ok(())
     }
 }

@@ -7,6 +7,8 @@ macOS の日本語入力メソッド。「かな」「英数」キーで切り�
 
 - `crates/kayoiji-core`: OS に依存しないエンジン。判定 (`detector.rs`)、状態機械 (`engine.rs`)、
   かな漢字変換 (`converter.rs`)、辞書 (`dict.rs`)、判断データベース (`rules.rs`、`data/rules.toml`)
+- `crates/kayoiji-check`: 英文チェックの部品。綴りの検査 (`spelling.rs`) と、言語モデルの補助プロセス
+  (`helper/english-check.swift`) の呼び出し (`review.rs`)
 - `crates/kayoiji-cli`: 辞書のビルド、動作確認 (`type`、`explain`)、精度の評価 (`evaluate`)
 - `src-tauri`: Tauri アプリ。`imk.rs` が InputMethodKit との接続、`overlay.rs` が候補ウインドウ
 - `pad/src-tauri`: KayoijiPad。エンジンを入力メソッドとして入れずに試すための、テキストエリアだけのアプリ
@@ -17,6 +19,7 @@ macOS の日本語入力メソッド。「かな」「英数」キーで切り�
 
 ```sh
 pnpm data                    # 辞書の元データを取得して data/build に辞書を作る
+pnpm helper                  # 英文チェックの補助プロセスを data/build にビルドする。無いとアプリのクレートをビルドできない
 cargo test --workspace
 cargo clippy --workspace --all-targets
 pnpm test                    # フロントエンドのユニットテスト (vitest)
@@ -31,14 +34,22 @@ pnpm pad                     # KayoijiPad を開発モードで起動する
   テストは小さな辞書 (`converter::tests::sample_dictionary`) で動くので、実辞書は要らない
 - エンジンの既定は日本語入力 (`EngineConfig::auto_switch` が false)。判定を通る場面のテストは `simulator()`
   (自動切り替え)、日本語入力のテストは `simulator_with(false)` で書く。`kayoiji-cli` はいつも自動切り替えで動く
-- エンジンの入力モードごとに、OS の入力モード (`Info.plist` の `ComponentInputModeDict`) が 1 つある。
-  メニューバーのアイコンは OS の入力モードで決まるので、エンジンのモードが変わったら
-  `imk.rs` の `select_mode` で OS に伝える。OS が選んだ入力モードには、そのまま入る (`mode_of`)。
-  OS が選んだモードを別のモードに選び直さない。「次の入力ソース」で順に送る時に、先へ進めなくなる。
-  設定 (`auto_switch`) が決めるのは「かな」キーで入るモードだけで、OS が「かな」キーで設定と違う側を
-  選んだ時は、続いて届く「かな」の打鍵で設定の側に入り直す
-- OS の入力モードを増やすと、登録済みの利用者は増えたモードが無効のままになる。インストールの
-  スクリプトが有効にするが、OS が認識していない時はログインし直す必要がある
+- 入力ソースの一覧に並ぶのも、メニューバーのアイコンが決まるのも、OS の入力モード (`Info.plist` の
+  `ComponentInputModeDict`) の単位。一覧に Kayoiji を 1 つだけ並べたままアイコンを切り替えるために、
+  Google 日本語入力と同じ形にしてある
+  - 直接入力は Kayoiji の中のモードにしない。エンジンが直接入力になったら、`imk.rs` が OS の英字の
+    キーボード配列を選ぶ (`input_source::select_ascii_layout`)。待ち時間は入れない。「かな」で OS が
+    Kayoiji を選び直すと、`mode_selected` がエンジンを「かな」で入るモードにする
+  - 入力モードは日本語入力 (`あ`) と自動切り替え (`通`) の 2 つで、設定 (`auto_switch`) に合う側だけを
+    有効にする (`imk.rs` の `sync_input_mode`、`input_source::keep_one_mode_enabled`)
+  - 英文チェックに OS の入力モードは無い
+- 「英数」を押すと OS の英字のキーボード配列に切り替わり、以後の打鍵は Kayoiji に届かない。「英数」を
+  続けて押す操作は作れない。続けて押す操作は「かな」で作る (`DOUBLE_PRESS_MS`)
+- 入力モードやアイコンを変えた版は、ログインし直すまで、システム設定の一覧やメニューバーに前の内容が残る
+  ことがある。OS が持っている内容は、`TISCreateInputSourceList` を読むだけの Swift で確かめられる
+  (入力ソースを登録・有効化・選択するコマンドは、利用者に断らずに実行しない)
+- 打鍵の文字は、Shift を反映した `characters` から取る (`imk.rs` の `key_press`)。
+  `charactersIgnoringModifiers` は、入力メソッドに届く時には Shift も無視した小文字になっている
 - メニューバーのアイコンは `scripts/make-menu-icon.swift` で作る
 - 変換の学習は 2 種類ある。文節ごとに選んだ候補 (`Learning::conversions`) は、エンジンが候補の先頭に
   置くだけで、読みが文節と一致する時にしか効かない。区切り直して覚えた語 (`Learning::phrases`) は、
@@ -64,6 +75,15 @@ pnpm pad                     # KayoijiPad を開発モードで起動する
   クリックでのキャレットの移動は、入力メソッドに通知されない
 - `scripts/install-macos.sh` の入れ替えの部分を変えたら、インストール先を変数で差し替えて
   スクラッチのディレクトリで実行し、失敗や中断の後に使える版が残ることを確かめる
+- 英文チェック (`InputMode::English`) は、エンジンが英文を受け取るだけで、綴りの検査 (`kayoiji-check` の
+  `spelling`、OS のスペルチェッカー) と訂正文・訳 (`review`、補助プロセス `helper/english-check.swift`) は
+  アプリ側 (`imk.rs`、KayoijiPad) がエンジンの外で作る。補助プロセスを変えたら、`pnpm helper` の後に
+  `KAYOIJI_ENGLISH_CHECK="$PWD/data/build/english-check-<ターゲット名>" cargo test -p kayoiji-check -- --ignored` で
+  実際の言語モデルを通して確かめる (テストの作業ディレクトリはクレートの場所なので、絶対パスで渡す)
+- 言語モデル (Foundation Models) には、訂正と訳を別々の 1 行の問いで頼み、答えの長さを抑える。
+  構造化出力 (`@Generable`) で 1 度に受け取ると、生成が止まらずに 10 秒以上かかることがあった
+- メインスレッドは補助プロセスを待たない。起動・依頼の書き込み・答えの読み取りは `Reviewer` の中のスレッドが行う。
+  綴りの訂正候補を作る処理 (1 語あたり数十ミリ秒) も打鍵のたびには行わず、打鍵が止まってから行う (`Guesses::Lookup`)
 - 辞書の形式 (`dict.rs` の `MAGIC`) を変えたら、`pnpm data` で `data/build` を作り直す
 - 辞書の元データ (`data/raw`) とビルドした辞書 (`data/build`) はコミットしない
 - コードコメントは日本語で、コードから読み取れない理由だけを書く

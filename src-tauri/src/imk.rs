@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use kayoiji_check::review::{Event, Review, Reviewer};
+use kayoiji_check::spelling::{self, Guesses, Spelling};
 use kayoiji_core::engine::{Engine, EngineConfig, InputMode, Key, Mode, Output, View};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
@@ -17,23 +19,68 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{ns_string, NSAttributedString, NSBundle, NSNotFound, NSRange, NSRect, NSString};
 use objc2_input_method_kit::{IMKInputController, IMKServer};
-use tauri::AppHandle;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 
+use crate::input_source;
 use crate::keys::{translate, KeyPress};
 use crate::overlay::{self, Rect};
 
 /// Info.plist で、入力メソッドの接続名を指定するキー。
 const CONNECTION_NAME_KEY: &str = "InputMethodConnectionName";
-/// Info.plist の `ComponentInputModeDict` に書いた、入力モードの ID。メニューバーのアイコンはモードごとに決まる。
+/// Info.plist の `ComponentInputModeDict` に書いた、入力モードの ID。メニューバーのアイコンは入力モードごとに決まる。
+/// 入力ソースの一覧に Kayoiji が 1 つだけ並ぶように、有効にするのは設定に合う側の 1 つだけにする
+/// (`sync_input_mode`)。直接入力に OS の入力モードは無く、OS の英字のキーボード配列に任せる。
 const JAPANESE_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Japanese";
 const AUTO_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Auto";
-const DIRECT_MODE_ID: &str = "com.cyberneura.inputmethod.Kayoiji.Roman";
 /// `setValue:forTag:client:` で、入力モードの切り替えを表すタグ (`kTextServiceInputModePropertyTag`、'imod')。
 const INPUT_MODE_TAG: isize = 0x696D_6F64;
 /// OS が入力モードを切り替えた直後に届く「かな」キーを、切り替えの一部とみなす時間。
 /// 自動切り替えでこのキーを打鍵として扱うと、切り替えた直後に「次の入力を日本語にする」指定が入ってしまう。
 /// ただし、OS が選んだのが設定と違う側のモードなら、このキーで設定の側のモードに入り直す。
 const MODE_SWITCH_SETTLE: Duration = Duration::from_millis(300);
+/// 英文チェックの補助プロセスの名前。アプリの実行ファイルと同じ場所に同梱する。
+const REVIEW_HELPER: &str = "english-check";
+/// 英文チェックで、打鍵がこの時間止まったら、綴りの訂正候補を作り、言語モデルに訂正文と訳を頼む。
+const CHECK_DELAY: Duration = Duration::from_millis(500);
+/// 綴りの訂正候補を数語ずつ作る間隔。
+const LOOKUP_INTERVAL: Duration = Duration::from_millis(30);
+/// 綴りの検査の結果を、候補ウインドウに届けるイベント。
+const SPELLING_EVENT: &str = "english-spelling";
+/// 言語モデルの訂正文と訳を、候補ウインドウに届けるイベント。
+const REVIEW_EVENT: &str = "english-review";
+/// 言語モデルが答えられなかったことを、候補ウインドウに届けるイベント。
+const REVIEW_FAILED_EVENT: &str = "english-review-failed";
+
+/// 英文チェックで受け取っている英文に対する、綴りの検査の結果と言語モデルの答え。
+#[derive(Default)]
+struct EnglishCheck {
+    /// 英文が変わるたびに増える番号。前の英文に対する依頼や答えを見分ける。
+    id: u64,
+    spelling: Option<Spelling>,
+    review: Option<Review>,
+}
+
+impl EnglishCheck {
+    /// Tab で英文と置き換える訂正案。言語モデルの訂正文があればそれ、無ければ綴りだけを直した文。
+    /// モデルが直す所は無いと答えたら、スペルチェッカーだけが誤りとみなした単語 (固有名詞など) を
+    /// 置き換えない。
+    fn suggestion(&self) -> Option<String> {
+        match &self.review {
+            Some(review) if review.unchanged => None,
+            Some(review) => Some(review.corrected.clone()),
+            None => self.spelling.as_ref().and_then(|spelling| spelling.corrected.clone()),
+        }
+    }
+}
+
+/// 候補ウインドウに届ける、綴りの検査の結果。
+#[derive(Clone, Serialize)]
+struct SpellingReport {
+    spelling: Option<Spelling>,
+    /// 言語モデルが使えるかどうか。使えなければ、訂正文と訳は届かない。
+    review_available: bool,
+}
 
 struct Runtime {
     app: AppHandle,
@@ -49,6 +96,9 @@ struct Runtime {
     mode_switched_at: Option<Instant>,
     /// 入力先の切り替えなどで、未確定文字列をまとめて確定した回数。
     commit_count: u64,
+    check: EnglishCheck,
+    /// 英文チェックの訂正文と訳を作る補助プロセス。起動できていなければ `None`。
+    reviewer: Option<Reviewer>,
     /// 保持していないと、OS からの接続を受けられなくなる。
     _server: Retained<IMKServer>,
 }
@@ -91,9 +141,9 @@ define_class!(
 
         /// 入力メニューや「英数」「かな」キーで、OS が入力モードを切り替えた時に呼ばれる。
         #[unsafe(method(setValue:forTag:client:))]
-        fn set_value(&self, value: Option<&AnyObject>, tag: isize, client: Option<&AnyObject>) {
+        fn set_value(&self, _value: Option<&AnyObject>, tag: isize, client: Option<&AnyObject>) {
             if tag == INPUT_MODE_TAG {
-                mode_selected(value, client);
+                mode_selected(client);
             }
         }
 
@@ -171,44 +221,18 @@ fn show_window(show: fn(&AppHandle) -> tauri::Result<()>) {
 /// 設定をエンジンに反映する。入力モードが変わる時は、入力中の文字列を入力先に確定する。
 /// メインスレッドで呼ぶ。
 pub fn set_config(engine: &Mutex<Engine>, config: EngineConfig) {
-    let (output, view, new_mode) = {
+    let (output, view) = {
         let mut engine = engine.lock().expect("engine lock");
-        let mode_before = engine.input_mode();
         let output = engine.set_config(config);
-        let mode = engine.input_mode();
-        (output, engine.view(), (mode != mode_before).then_some(mode))
+        (output, engine.view())
     };
+    // OS の入力モードを替えると、入力先が外れる (`commit_all`) ことがある。その前に確定しておく。
     let client = RUNTIME.with(|runtime| runtime.borrow().as_ref().and_then(|runtime| runtime.client.clone()));
-    let Some(client) = client else {
-        return;
-    };
-    apply(&client, output);
-    refresh_overlay(&client, view);
-    if let Some(mode) = new_mode {
-        select_mode(&client, mode);
+    if let Some(client) = client {
+        apply(&client, output);
+        refresh_overlay(&client, view);
     }
-}
-
-const MODES: [InputMode; 3] = [InputMode::Japanese, InputMode::Auto, InputMode::Direct];
-
-fn mode_id(mode: InputMode) -> &'static str {
-    match mode {
-        InputMode::Japanese => JAPANESE_MODE_ID,
-        InputMode::Auto => AUTO_MODE_ID,
-        InputMode::Direct => DIRECT_MODE_ID,
-    }
-}
-
-/// エンジンの入力モードを OS に伝える。メニューバーのアイコンが変わる。
-fn select_mode(client: &AnyObject, mode: InputMode) {
-    let identifier = NSString::from_str(mode_id(mode));
-    // SAFETY: `selectInputMode:` は IMKTextInput のメソッド。
-    let _: () = unsafe { msg_send![client, selectInputMode: &*identifier] };
-}
-
-/// OS が選んだ入力モードに対応する、エンジンのモード。
-fn mode_of(identifier: &str) -> Option<InputMode> {
-    MODES.into_iter().find(|&mode| mode_id(mode) == identifier)
+    sync_input_mode();
 }
 
 /// 入力メソッドのサーバーを起動する。入力メソッドのバンドルとして起動されていなければ `false` を返す。
@@ -240,21 +264,189 @@ pub fn start(app: AppHandle, engine: Arc<Mutex<Engine>>) -> bool {
             last_view,
             mode_switched_at: None,
             commit_count: 0,
+            check: EnglishCheck::default(),
+            reviewer: None,
             _server: server,
         });
     });
+    start_reviewer();
+    sync_input_mode();
     true
+}
+
+/// OS の入力モードを、設定に合わせる。日本語入力と自動切り替えのうち、「かな」キーで入る側だけを
+/// 有効にする。メニューバーのアイコンが、その側のものになる。
+fn sync_input_mode() {
+    let auto = RUNTIME.with(|runtime| {
+        let runtime = runtime.borrow();
+        let engine = runtime.as_ref()?.engine.lock().expect("engine lock");
+        Some(engine.kana_key_mode() == InputMode::Auto)
+    });
+    match auto {
+        Some(true) => input_source::keep_one_mode_enabled(AUTO_MODE_ID, JAPANESE_MODE_ID),
+        Some(false) => input_source::keep_one_mode_enabled(JAPANESE_MODE_ID, AUTO_MODE_ID),
+        None => {}
+    }
+}
+
+
+/// 英文チェックの補助プロセスを起動する。起動できなくても、綴りの検査だけで英文チェックは使える。
+/// 言語モデルが使えるかどうかは、起動した後に補助プロセスが知らせてくる。ここでは待たない。
+fn start_reviewer() {
+    let (Some(app), Ok(executable)) = (app_handle(), std::env::current_exe()) else {
+        return;
+    };
+    let reviewer = Reviewer::start(&executable.with_file_name(REVIEW_HELPER), move |event| {
+        let _ = app.run_on_main_thread(move || review_event(event));
+    });
+    RUNTIME.with(|runtime| {
+        if let Some(runtime) = runtime.borrow_mut().as_mut() {
+            runtime.reviewer = Some(reviewer);
+        }
+    });
+}
+
+/// 英文チェックで受け取っている英文が変わった時に、綴りを調べ直す。メインスレッドで呼ぶ。
+///
+/// ここでは、すでに調べた単語の訂正候補だけを付ける。新しい候補を作るのには 1 語あたり数十ミリ秒
+/// かかるので、打鍵のたびには作らない。打鍵が止まったら、残りの候補を作り、訂正文と訳を頼む。
+fn check_english(app: &AppHandle, text: &str) {
+    let spelling = (!text.trim().is_empty()).then(|| spelling::check(text, Guesses::Known));
+    let waits = spelling.is_some();
+    let Some(id) = store_check(spelling.clone()) else {
+        return;
+    };
+    report_spelling(app, spelling);
+    if !waits {
+        return;
+    }
+    let app = app.clone();
+    let text = text.to_string();
+    thread::spawn(move || {
+        thread::sleep(CHECK_DELAY);
+        let _ = app.clone().run_on_main_thread(move || complete_check(&app, id, &text, true));
+    });
+}
+
+/// 英文が変わったことを記録して、新しい番号を返す。前の英文に対する依頼と答えは、番号が違うので捨てられる。
+fn store_check(spelling: Option<Spelling>) -> Option<u64> {
+    RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let runtime = runtime.as_mut()?;
+        runtime.check = EnglishCheck {
+            id: runtime.check.id + 1,
+            spelling,
+            review: None,
+        };
+        Some(runtime.check.id)
+    })
+}
+
+fn current_check_id() -> Option<u64> {
+    RUNTIME.with(|runtime| runtime.borrow().as_ref().map(|runtime| runtime.check.id))
+}
+
+fn report_spelling(app: &AppHandle, spelling: Option<Spelling>) {
+    let review_available = RUNTIME.with(|runtime| {
+        let runtime = runtime.borrow();
+        runtime
+            .as_ref()
+            .and_then(|runtime| runtime.reviewer.as_ref())
+            .is_some_and(Reviewer::is_available)
+    });
+    let report = SpellingReport {
+        spelling,
+        review_available,
+    };
+    if let Err(error) = app.emit_to(overlay::LABEL, SPELLING_EVENT, report) {
+        eprintln!("kayoiji: candidate window: {error}");
+    }
+}
+
+/// 打鍵が止まった。待っている間に英文が変わっていなければ、残りの訂正候補を作り、訂正文と訳を頼む。
+///
+/// 訂正候補は 1 回に数語ずつ作り、残りがあれば間を置いて続ける。その間に届いた打鍵を先に処理するため。
+/// 訂正文と訳を頼むのは最初の 1 回 (`ask_review`) だけ。
+fn complete_check(app: &AppHandle, id: u64, text: &str, ask_review: bool) {
+    if current_check_id() != Some(id) {
+        return;
+    }
+    let spelling = spelling::check(text, Guesses::Lookup);
+    let pending = spelling.pending;
+    RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let Some(runtime) = runtime.as_mut() else {
+            return;
+        };
+        runtime.check.spelling = Some(spelling.clone());
+        if let Some(reviewer) = runtime.reviewer.as_ref().filter(|_| ask_review) {
+            reviewer.request(id, text);
+        }
+    });
+    report_spelling(app, Some(spelling));
+    if !pending {
+        return;
+    }
+    let app = app.clone();
+    let text = text.to_string();
+    thread::spawn(move || {
+        thread::sleep(LOOKUP_INTERVAL);
+        let _ = app.clone().run_on_main_thread(move || complete_check(&app, id, &text, false));
+    });
+}
+
+/// 補助プロセスからの知らせ。メインスレッドで呼ぶ。答えを待つ間に英文が変わっていたら捨てる。
+fn review_event(event: Event) {
+    let (id, review) = match event {
+        Event::Review(review) => (Some(review.id), Some(review)),
+        Event::Failed { id } => (Some(id), None),
+        Event::Unavailable(reason) => {
+            eprintln!("kayoiji: the language model is not available: {reason}");
+            (None, None)
+        }
+    };
+    let app = RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let runtime = runtime.as_mut()?;
+        if id.is_some_and(|id| id != runtime.check.id) {
+            return None;
+        }
+        runtime.check.review = review.clone();
+        Some(runtime.app.clone())
+    });
+    let Some(app) = app else {
+        return;
+    };
+    let sent = match review {
+        Some(review) => app.emit_to(overlay::LABEL, REVIEW_EVENT, review),
+        // 答えが来ないと分かったら、候補ウインドウが待ち続けないように知らせる。
+        None => app.emit_to(overlay::LABEL, REVIEW_FAILED_EVENT, ()),
+    };
+    if let Err(error) = sent {
+        eprintln!("kayoiji: candidate window: {error}");
+    }
 }
 
 fn key_press(event: &NSEvent) -> KeyPress {
     let flags = event.modifierFlags();
-    let character = event
-        .charactersIgnoringModifiers()
-        .and_then(|characters| characters.to_string().chars().next());
+    let shift = flags.contains(NSEventModifierFlags::Shift);
+    let modified = flags.intersects(
+        NSEventModifierFlags::Control | NSEventModifierFlags::Option | NSEventModifierFlags::Command,
+    );
+    // Control などを押した打鍵は、キーの元の文字で見分ける (Ctrl+J)。それ以外は、Shift を反映した
+    // 文字を使う。Shift + 数字の記号などは、こちらにしか入っていない。
+    let first = |characters: Option<Retained<NSString>>| {
+        characters.and_then(|characters| characters.to_string().chars().next())
+    };
+    let character = if modified {
+        first(event.charactersIgnoringModifiers())
+    } else {
+        first(event.characters()).or_else(|| first(event.charactersIgnoringModifiers()))
+    };
     KeyPress {
         key_code: event.keyCode(),
-        character,
-        shift: flags.contains(NSEventModifierFlags::Shift),
+        character: character.map(|character| crate::keys::with_shift(character, shift)),
+        shift,
         control: flags.contains(NSEventModifierFlags::Control),
         option: flags.contains(NSEventModifierFlags::Option),
         command: flags.contains(NSEventModifierFlags::Command),
@@ -301,25 +493,36 @@ fn handle_key(event: &NSEvent, client: &AnyObject) -> bool {
         let now = runtime.started.elapsed().as_millis() as u64;
         let mut engine = runtime.engine.lock().expect("engine lock");
         let mode_before = engine.input_mode();
-        let output = engine.handle(key, now);
+        // 英文チェックの Tab は、受け取っている英文を訂正案に置き換える。
+        let checking = mode_before == InputMode::English && !engine.preedit().is_empty();
+        let correction = (key == Key::Tab && checking)
+            .then(|| runtime.check.suggestion())
+            .flatten();
+        let output = match correction {
+            Some(text) => engine.replace_english(&text),
+            None => engine.handle(key, now),
+        };
         if let Some(error) = engine.take_error() {
             eprintln!("kayoiji: could not save what was learned: {error}");
         }
         let deadline = engine.timeout_deadline().map(|deadline| deadline.saturating_sub(now));
-        let mode = engine.input_mode();
-        Some((output, engine.view(), deadline, (mode != mode_before).then_some(mode)))
+        // 直接入力のまま押した「英数」でも選び直す。前に英字のキーボード配列を選べなかった時のやり直しになる。
+        let left_for_direct =
+            engine.input_mode() == InputMode::Direct && (mode_before != InputMode::Direct || key == Key::Muhenkan);
+        Some((output, engine.view(), deadline, left_for_direct))
     });
-    let Some((output, view, deadline, new_mode)) = handled else {
+    let Some((output, view, deadline, left_for_direct)) = handled else {
         return false;
     };
     let consumed = output.consumed;
     apply(client, output);
     refresh_overlay(client, view);
-    if let Some(mode) = new_mode {
-        select_mode(client, mode);
-    }
     if let Some(delay) = deadline {
         schedule_timeout(Duration::from_millis(delay + 1));
+    }
+    if left_for_direct {
+        // 直接入力は、OS の英字のキーボード配列に任せる。メニューバーのアイコンが英字のものになる。
+        input_source::select_ascii_layout();
     }
     consumed
 }
@@ -330,15 +533,24 @@ fn handle_key(event: &NSEvent, client: &AnyObject) -> bool {
 /// 設定と違う側のモードなら、切り替えはまだ済んでいない。エンジンに渡して、設定の側のモードに入り直す。
 fn settles_mode_switch() -> bool {
     RUNTIME.with(|runtime| {
-        let runtime = runtime.borrow();
-        let Some(runtime) = runtime.as_ref() else {
+        let mut runtime = runtime.borrow_mut();
+        let Some(runtime) = runtime.as_mut() else {
             return false;
         };
         let just_switched = runtime
             .mode_switched_at
             .is_some_and(|switched| switched.elapsed() < MODE_SWITCH_SETTLE);
-        let engine = runtime.engine.lock().expect("engine lock");
-        just_switched && engine.input_mode() == engine.kana_key_mode()
+        let mut engine = runtime.engine.lock().expect("engine lock");
+        let settles = just_switched && engine.input_mode() == engine.kana_key_mode();
+        if settles {
+            // 切り替えの一部とみなすのは、切り替えの後の最初の「かな」だけ。続けて押した 2 度目まで
+            // 吸い込むと、2 度押しがエンジンに届かない。
+            runtime.mode_switched_at = None;
+            // エンジンに渡さない打鍵も、「かな」の 2 度押しの 1 度目には数える。数えないと、英字の
+            // キーボード配列から英文チェックに入るのに、「かな」を 3 度押すことになる。
+            engine.mark_henkan(runtime.started.elapsed().as_millis() as u64);
+        }
+        settles
     })
 }
 
@@ -456,14 +668,21 @@ fn refresh_overlay(client: &AnyObject, view: View) {
     let Some(app) = app else {
         return;
     };
-    let anchor = if view.mode == Mode::Direct {
+    let anchor = if overlay::is_hidden(&view) {
         None
     } else {
         preedit_rect(client)
     };
+    // 英文チェックを抜けた時も呼ぶ。空の英文として記録し直すと、前の英文への依頼と答えが捨てられる。
+    let english = if view.mode == Mode::Checking {
+        view.reading.clone()
+    } else {
+        String::new()
+    };
     if let Err(error) = overlay::update(&app, view, anchor) {
         eprintln!("kayoiji: candidate window: {error}");
     }
+    check_english(&app, &english);
 }
 
 /// 表示中の未確定文字列を、そのまま確定する。
@@ -473,6 +692,11 @@ fn commit_all(client: Option<&AnyObject>) {
         let runtime = runtime.as_mut()?;
         runtime.client = None;
         runtime.commit_count += 1;
+        // 確定した英文に対する訂正案を残さない。残すと、次の Tab がその訂正案に使われて消える。
+        runtime.check = EnglishCheck {
+            id: runtime.check.id + 1,
+            ..EnglishCheck::default()
+        };
         let mut engine = runtime.engine.lock().expect("engine lock");
         let commit = engine.commit_composition();
         Some((commit, engine.view(), runtime.app.clone()))
@@ -494,31 +718,28 @@ fn commit_all(client: Option<&AnyObject>) {
     }
     RUNTIME.with(|runtime| {
         if let Some(runtime) = runtime.borrow_mut().as_mut() {
-            runtime.last_view = view;
+            runtime.last_view = view.clone();
         }
     });
-    if let Err(error) = overlay::hide(&app) {
+    if let Err(error) = overlay::hide(&app, view) {
         eprintln!("kayoiji: candidate window: {error}");
     }
 }
 
 /// OS が切り替えた入力モードを、エンジンに反映する。
-fn mode_selected(value: Option<&AnyObject>, client: Option<&AnyObject>) {
-    let Some(mode) = value
-        .and_then(|value| value.downcast_ref::<NSString>())
-        .and_then(|identifier| mode_of(&identifier.to_string()))
-    else {
-        return;
-    };
+fn mode_selected(client: Option<&AnyObject>) {
     let switched = RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
         let runtime = runtime.as_mut()?;
         let mut engine = runtime.engine.lock().expect("engine lock");
-        // 同じモードの通知 (キーで切り替えた時に OS へ伝えた分の折り返しなど) は、切り替えとして扱わない。
-        if engine.input_mode() == mode {
+        // 有効な入力モードは 1 つなので、この通知は「この入力メソッドが選ばれた」か「入力先が替わった」を表す。
+        // 直接入力のまま選ばれた時 (「英数」で英字のキーボード配列に切り替え、「かな」で戻って来た時) は、
+        // 「かな」で入るモードにする。それ以外のモードは、そのまま続ける。
+        if engine.input_mode() != InputMode::Direct {
             return None;
         }
         runtime.mode_switched_at = Some(Instant::now());
+        let mode = engine.kana_key_mode();
         Some((engine.set_input_mode(mode), engine.view()))
     });
     let (Some((output, view)), Some(client)) = (switched, client) else {
@@ -563,35 +784,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_input_mode_is_declared_in_the_info_plist() {
+    fn the_info_plist_declares_the_two_input_modes() {
         // Arrange
         let info_plist = include_str!("../Info.plist");
 
-        for mode in MODES {
-            // Act
-            let identifier = mode_id(mode);
-
-            // Assert
-            // ID が食い違うと、OS は切り替えを黙って無視する。メニューバーのアイコンが変わらなくなる。
-            let declared = info_plist
+        // Act
+        let modes = info_plist.matches("<key>tsInputModeScriptKey</key>").count();
+        let declared = |identifier: &str| {
+            info_plist
                 .split_once(&format!("<key>{identifier}</key>"))
                 .and_then(|(_, mode)| mode.split_once("<key>TISInputSourceID</key>"))
                 .and_then(|(_, rest)| rest.split_once("<string>"))
                 .and_then(|(_, rest)| rest.split_once("</string>"))
-                .map(|(source_id, _)| source_id);
-            assert_eq!(declared, Some(identifier));
-            let order = info_plist
-                .split_once("<key>tsVisibleInputModeOrderedArrayKey</key>")
-                .map(|(_, order)| order);
-            assert!(order.is_some_and(|order| order.contains(&format!("<string>{identifier}</string>"))));
+                .map(|(source_id, _)| source_id.to_string())
+        };
+
+        // Assert
+        // 入力モードは、アイコンの違う日本語入力と自動切り替えの 2 つ。ID が食い違うと、有効にする側を
+        // 入れ替えられない。
+        assert_eq!(modes, 2);
+        assert_eq!(declared(JAPANESE_MODE_ID).as_deref(), Some(JAPANESE_MODE_ID));
+        assert_eq!(declared(AUTO_MODE_ID).as_deref(), Some(AUTO_MODE_ID));
+    }
+
+    fn review(corrected: &str, unchanged: bool) -> Review {
+        Review {
+            id: 1,
+            corrected: corrected.to_string(),
+            unchanged,
+            translation: String::new(),
+        }
+    }
+
+    fn spelling_fix(corrected: &str) -> Spelling {
+        Spelling {
+            misspellings: Vec::new(),
+            corrected: Some(corrected.to_string()),
+            pending: false,
         }
     }
 
     #[test]
-    fn an_input_mode_chosen_by_the_os_maps_back_to_the_engine_mode() {
-        for mode in MODES {
-            assert_eq!(mode_of(mode_id(mode)), Some(mode));
-        }
-        assert_eq!(mode_of("com.apple.keylayout.ABC"), None);
+    fn the_spelling_fix_is_suggested_until_the_language_model_answers() {
+        let check = EnglishCheck {
+            spelling: Some(spelling_fix("Please send me the file")),
+            ..EnglishCheck::default()
+        };
+        assert_eq!(check.suggestion().as_deref(), Some("Please send me the file"));
     }
+
+    #[test]
+    fn the_correction_of_the_language_model_is_preferred() {
+        let check = EnglishCheck {
+            spelling: Some(spelling_fix("I has a pen")),
+            review: Some(review("I have a pen.", false)),
+            ..EnglishCheck::default()
+        };
+        assert_eq!(check.suggestion().as_deref(), Some("I have a pen."));
+    }
+
+    #[test]
+    fn nothing_is_suggested_when_the_language_model_finds_nothing_to_fix() {
+        // 固有名詞のように、スペルチェッカーだけが誤りとみなした単語を置き換えない。
+        let check = EnglishCheck {
+            spelling: Some(spelling_fix("Kayoiji is nice")),
+            review: Some(review("Kayoji is nice", true)),
+            ..EnglishCheck::default()
+        };
+        assert_eq!(check.suggestion(), None);
+    }
+
 }

@@ -2,7 +2,6 @@
 // 使い方: swift scripts/make-menu-icon.swift <出力先の PDF> [描く文字]
 //   swift scripts/make-menu-icon.swift src-tauri/icons/menu-icon.pdf 通              (自動切り替え)
 //   swift scripts/make-menu-icon.swift src-tauri/icons/menu-icon-japanese.pdf あ     (日本語入力)
-//   swift scripts/make-menu-icon.swift src-tauri/icons/menu-icon-roman.pdf A_        (直接入力)
 import AppKit
 
 let size = 18.0

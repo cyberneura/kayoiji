@@ -69,6 +69,15 @@ pub fn translate(press: KeyPress, mode: Mode) -> Key {
     }
 }
 
+/// キーの文字に Shift を反映する。入力メソッドに届く文字は、Shift を押していても小文字のことがある。
+pub fn with_shift(character: char, shift: bool) -> char {
+    if shift && character.is_ascii_lowercase() {
+        character.to_ascii_uppercase()
+    } else {
+        character
+    }
+}
+
 /// 矢印キーやファンクションキーは、私用領域の文字として届く。
 fn is_function_key(c: char) -> bool {
     ('\u{F700}'..='\u{F8FF}').contains(&c)
@@ -77,6 +86,15 @@ fn is_function_key(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shift_makes_a_lowercase_letter_uppercase() {
+        assert_eq!(with_shift('i', true), 'I');
+        assert_eq!(with_shift('i', false), 'i');
+        // 記号と、すでに大文字の文字は変えない。
+        assert_eq!(with_shift('!', true), '!');
+        assert_eq!(with_shift('I', true), 'I');
+    }
 
     fn character(c: char) -> KeyPress {
         KeyPress {

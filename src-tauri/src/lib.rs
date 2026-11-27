@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 mod imk;
 #[cfg(target_os = "macos")]
+mod input_source;
+#[cfg(target_os = "macos")]
 mod keys;
 mod overlay;
 mod settings;

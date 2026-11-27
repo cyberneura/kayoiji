@@ -61,15 +61,22 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
 }
 
 /// 表示内容を候補ウインドウへ反映する。`anchor` は未確定文字列の先頭の位置。
+/// 候補ウインドウに出すものが無い表示内容かどうか。英文チェックでも、英文を受け取るまでは出さない。
+pub fn is_hidden(view: &View) -> bool {
+    view.mode == Mode::Direct || (view.mode == Mode::Checking && view.reading.is_empty())
+}
+
 pub fn update(app: &AppHandle, view: View, anchor: Option<Rect>) -> tauri::Result<()> {
     let overlay = app.state::<Overlay>();
     let Some(window) = app.get_webview_window(LABEL) else {
         return Ok(());
     };
     *overlay.latest.lock().expect("overlay lock") = view.clone();
-    if view.mode == Mode::Direct {
+    if is_hidden(&view) {
         overlay.wanted.store(false, Ordering::Relaxed);
-        return window.hide();
+        // 空の内容も渡す。候補ウインドウは前の英文と比べて、訂正文と訳を残すかを決めている。
+        window.hide()?;
+        return app.emit_to(LABEL, VIEW_EVENT, &view);
     }
     overlay.wanted.store(true, Ordering::Relaxed);
     if anchor.is_some() {
@@ -78,13 +85,16 @@ pub fn update(app: &AppHandle, view: View, anchor: Option<Rect>) -> tauri::Resul
     app.emit_to(LABEL, VIEW_EVENT, &view)
 }
 
-pub fn hide(app: &AppHandle) -> tauri::Result<()> {
+/// 候補ウインドウを隠す。`view` は確定した後の内容で、確定した文字列を最後の内容として残さないために置き換える。
+pub fn hide(app: &AppHandle, view: View) -> tauri::Result<()> {
     let overlay = app.state::<Overlay>();
+    *overlay.latest.lock().expect("overlay lock") = view.clone();
     overlay.wanted.store(false, Ordering::Relaxed);
-    match app.get_webview_window(LABEL) {
-        Some(window) => window.hide(),
-        None => Ok(()),
-    }
+    let Some(window) = app.get_webview_window(LABEL) else {
+        return Ok(());
+    };
+    window.hide()?;
+    app.emit_to(LABEL, VIEW_EVENT, &view)
 }
 
 /// 未確定文字列の下に置く。画面の下端からはみ出す時は上に置く。

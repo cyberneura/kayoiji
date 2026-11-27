@@ -16,6 +16,8 @@ pub struct Settings {
     pub sequence_timeout_ms: u64,
     /// 英語か日本語かを判定しながら入力する。false なら、「かな」「英数」キーで切り替える。
     pub auto_switch: bool,
+    /// 日本語入力で英語を打ち始めたら (大文字、ローマ字として読めない並び)、直接入力に切り替える。
+    pub leave_japanese_for_english: bool,
 }
 
 impl Default for Settings {
@@ -23,6 +25,7 @@ impl Default for Settings {
         Self {
             sequence_timeout_ms: EngineConfig::default().sequence_timeout_ms,
             auto_switch: false,
+            leave_japanese_for_english: false,
         }
     }
 }
@@ -68,6 +71,7 @@ impl Settings {
         EngineConfig {
             sequence_timeout_ms: self.sequence_timeout_ms,
             auto_switch: self.auto_switch,
+            leave_japanese_for_english: self.leave_japanese_for_english,
             ..EngineConfig::default()
         }
     }
@@ -94,6 +98,7 @@ mod tests {
         let settings = Settings {
             sequence_timeout_ms: 350,
             auto_switch: true,
+            leave_japanese_for_english: true,
         };
 
         // Act
@@ -104,6 +109,7 @@ mod tests {
         assert_eq!(loaded, settings);
         assert_eq!(loaded.engine_config().sequence_timeout_ms, 350);
         assert!(loaded.engine_config().auto_switch);
+        assert!(loaded.engine_config().leave_japanese_for_english);
     }
 
     #[test]
@@ -134,6 +140,7 @@ mod tests {
         let settings: Settings = toml::from_str("sequence_timeout_ms = 350\n").expect("valid");
         assert_eq!(settings.sequence_timeout_ms, 350);
         assert!(!settings.engine_config().auto_switch);
+        assert!(!settings.engine_config().leave_japanese_for_english);
     }
 
     #[test]

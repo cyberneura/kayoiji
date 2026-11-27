@@ -52,7 +52,9 @@ export interface KeyInfo {
  * キーボードイベントをエンジンのキーに読み替える。
  * カーソル移動やショートカットなど、エンジンに渡さないキーは null を返す。
  */
-export function keyFromEvent(event: KeyInfo, mode: Mode): PadKey | null {
+export function keyFromEvent(event: KeyInfo, mode: Mode, reading = ''): PadKey | null {
+  // 英文チェックでも、英文が空の間はエンジンが矢印キーを入力先に通すので、カーソル移動にする。
+  const movesCaret = mode === 'direct' || (mode === 'checking' && !reading);
   // 「変換」「かな」と「無変換」「英数」。
   if (event.code === 'Convert' || event.code === 'Lang1') return { type: 'henkan' };
   if (event.code === 'NonConvert' || event.code === 'Lang2') return { type: 'muhenkan' };
@@ -80,16 +82,16 @@ export function keyFromEvent(event: KeyInfo, mode: Mode): PadKey | null {
       return { type: 'escape' };
     case 'Tab':
       return { type: 'tab' };
-    // 矢印キーは、日本語の入力中はエンジンに渡す。それ以外はカーソル移動。
+    // 矢印キーは、日本語の入力中と、英文チェックで英文がある間はエンジンに渡す。それ以外はカーソル移動。
     case 'ArrowUp':
-      return mode === 'direct' ? null : { type: 'up' };
+      return movesCaret ? null : { type: 'up' };
     case 'ArrowDown':
-      return mode === 'direct' ? null : { type: 'down' };
+      return movesCaret ? null : { type: 'down' };
     case 'ArrowLeft':
-      if (mode === 'direct') return null;
+      if (movesCaret) return null;
       return event.shiftKey ? { type: 'shift_left' } : { type: 'left' };
     case 'ArrowRight':
-      if (mode === 'direct') return null;
+      if (movesCaret) return null;
       return event.shiftKey ? { type: 'shift_right' } : { type: 'right' };
     case 'F7':
       return { type: 'katakana' };

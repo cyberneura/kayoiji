@@ -10,22 +10,32 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use kayoiji_check::review::{Event, Reviewer};
+use kayoiji_check::spelling::{self, Guesses, Spelling};
 use kayoiji_core::engine::{Engine, EngineConfig, Key, Output, View};
 use kayoiji_core::learning::Learning;
 use kayoiji_core::resources::{load_rules, open_engine};
 use serde::{Deserialize, Serialize};
 use tauri::path::BaseDirectory;
-use tauri::{App, Manager, State};
+use tauri::{App, Emitter, Manager, State};
 
 /// 辞書があるディレクトリを差し替える環境変数。開発時に使う。
 const DATA_DIR_VARIABLE: &str = "KAYOIJI_DATA_DIR";
 /// 入力メソッド本体の設定ディレクトリ。利用者が足した判断データベースを、ここから読む。
 const INPUT_METHOD_IDENTIFIER: &str = "com.cyberneura.inputmethod.Kayoiji";
+/// 英文チェックの補助プロセスの名前。アプリの実行ファイルと同じ場所に同梱する。
+const REVIEW_HELPER: &str = "english-check";
+/// 補助プロセスの答え (訂正文と訳) を、画面に届けるイベント。
+const REVIEW_EVENT: &str = "english-review";
+/// 言語モデルが答えられなかったことを、画面に届けるイベント。
+const REVIEW_FAILED_EVENT: &str = "english-review-failed";
 
 struct PadState {
     engine: Mutex<Engine>,
     /// 打鍵の時刻の基準。
     started: Instant,
+    /// 英文チェックの訂正文と訳を作る補助プロセス。終了時に捨てる。
+    reviewer: Mutex<Option<Reviewer>>,
 }
 
 impl PadState {
@@ -146,6 +156,34 @@ fn pad_reset(state: State<'_, PadState>, reason: String) -> View {
     engine.view()
 }
 
+/// 英文チェックで受け取っている英文の、綴りが誤っている単語と訂正候補。
+/// `lookup` が false なら、すでに調べた単語の候補だけを付ける。打鍵のたびに呼ぶ時に使う。
+#[tauri::command]
+fn pad_spelling(text: String, lookup: bool) -> Spelling {
+    spelling::check(&text, if lookup { Guesses::Lookup } else { Guesses::Known })
+}
+
+/// 英文の訂正と訳を頼む。答えは `english-review` のイベントで届く。
+/// 言語モデルが使えない時は、その理由をエラーで返す。
+#[tauri::command]
+fn pad_review(state: State<'_, PadState>, id: u64, text: String) -> Result<(), String> {
+    let reviewer = state.reviewer.lock().expect("reviewer lock");
+    let reviewer = reviewer.as_ref()
+        .filter(|reviewer| reviewer.is_available())
+        .ok_or("この Mac では言語モデルを使えません")?;
+    reviewer.request(id, &text);
+    Ok(())
+}
+
+/// 英文チェックで受け取っている英文を、訂正した文に置き換える。
+#[tauri::command]
+fn pad_replace_english(state: State<'_, PadState>, text: String) -> PadResponse {
+    let now = state.now();
+    let mut engine = state.engine.lock().expect("engine lock");
+    let output = engine.replace_english(&text);
+    response(&engine, output, now)
+}
+
 /// OS の入力メソッドが有効かどうか。有効な間は、テキストエリアの入力を OS に任せる。
 #[tauri::command]
 fn pad_system_input_method() -> bool {
@@ -159,6 +197,25 @@ fn data_dir(app: &App) -> tauri::Result<PathBuf> {
     }
 }
 
+/// 英文チェックの補助プロセスを起動する。起動できなくても、綴りの検査だけで英文チェックは使える。
+fn start_reviewer(app: &App) -> Option<Reviewer> {
+    let helper = std::env::current_exe().ok()?.with_file_name(REVIEW_HELPER);
+    let handle = app.handle().clone();
+    Some(Reviewer::start(&helper, move |event| {
+        let sent = match event {
+            Event::Review(review) => handle.emit(REVIEW_EVENT, review),
+            Event::Failed { id } => handle.emit(REVIEW_FAILED_EVENT, id),
+            Event::Unavailable(reason) => {
+                eprintln!("kayoiji-pad: the language model is not available: {reason}");
+                Ok(())
+            }
+        };
+        if let Err(error) = sent {
+            eprintln!("kayoiji-pad: could not deliver a review: {error}");
+        }
+    }))
+}
+
 fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
     let user_rules = app.path().config_dir()?.join(INPUT_METHOD_IDENTIFIER).join("rules.toml");
     let (rules, rules_error) = load_rules(&user_rules);
@@ -170,6 +227,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
     app.manage(PadState {
         engine: Mutex::new(engine),
         started: Instant::now(),
+        reviewer: Mutex::new(start_reviewer(app)),
     });
     Ok(())
 }
@@ -182,10 +240,19 @@ pub fn run() {
             pad_timeout,
             pad_set_auto_switch,
             pad_reset,
+            pad_spelling,
+            pad_review,
+            pad_replace_english,
             pad_system_input_method
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running KayoijiPad");
+        .build(tauri::generate_context!())
+        .expect("error while building KayoijiPad")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                // 通知の関数が持つ AppHandle と管理中の Reviewer の循環を、終了時に切る。
+                app.state::<PadState>().reviewer.lock().expect("reviewer lock").take();
+            }
+        });
 }
 
 #[cfg(test)]

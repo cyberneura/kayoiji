@@ -33,6 +33,10 @@ const LEARNABLE_WORD_LEN: usize = 12;
 /// 区切り直した範囲を 1 語として覚える時の、読みの長さの上限 (文字数)。前の文節を区切り直すと後ろの
 /// 文節も変換し直されるので、文の大半が 1 つの範囲になることがある。それは語ではないので覚えない。
 const PHRASE_MAX_CHARS: usize = 12;
+/// 「かな」をこの時間 (ミリ秒) の内に 2 度押したら、英文チェックにする。
+/// 「英数」の 2 度押しは使えない。「英数」では OS の英字のキーボード配列に切り替わるので、
+/// 2 度目が入力メソッドに届かない。
+pub const DOUBLE_PRESS_MS: u64 = 400;
 /// 覚える語を作る、辞書の語の数の下限。辞書の 1 語を分けて選んだだけなら、辞書がすでに変換できる。
 const PHRASE_MIN_WORDS: usize = 2;
 
@@ -49,6 +53,10 @@ pub struct EngineConfig {
     /// 「かな」キーで入る入力モードを、自動切り替え (`InputMode::Auto`) にする。
     /// false なら日本語入力 (`InputMode::Japanese`)。
     pub auto_switch: bool,
+    /// 日本語入力 (`InputMode::Japanese`) で英語を打ち始めたら、直接入力に切り替える。
+    /// 英語を打ち始めたとみなすのは、大文字の英字と、ローマ字の規則に無い並び ("st", "pl")。
+    /// "thi" (てぃ) のように規則にある並びと、その途中 ("th") は、日本語のままにする。
+    pub leave_japanese_for_english: bool,
     pub detector: DetectorConfig,
 }
 
@@ -59,6 +67,7 @@ impl Default for EngineConfig {
             candidates_per_page: 9,
             english_words_to_leave_japanese: 2,
             auto_switch: false,
+            leave_japanese_for_english: false,
             detector: DetectorConfig::default(),
         }
     }
@@ -169,6 +178,9 @@ impl Step {
 pub enum InputMode {
     /// すべての打鍵を日本語として入力する。
     Japanese,
+    /// 英文チェック。英文を未確定文字列として受け取り、確定するまで入力先に出さない。
+    /// 受け取っている間の綴りの訂正や訳は、エンジンの外で作って表示する。
+    English,
     /// 英語か日本語かを判定しながら入力する。
     Auto,
     /// 入力モードを切り替えるキー以外の打鍵を、そのまま入力先へ通す。
@@ -181,6 +193,8 @@ pub enum Mode {
     Direct,
     Composing,
     Converting,
+    /// 英文チェックで、英文を受け取っている。`View::reading` がその英文。
+    Checking,
 }
 
 /// 候補ウインドウに表示する内容。
@@ -395,6 +409,10 @@ pub struct Engine {
     /// 次の入力を、判定せずに日本語として始める。
     force_next: bool,
     last_error: Option<io::Error>,
+    /// 英文チェックで受け取っている英文。
+    english: String,
+    /// 最後に「かな」が押された時刻。2 度押しを見分ける。
+    last_henkan_ms: Option<u64>,
 }
 
 impl Engine {
@@ -415,6 +433,8 @@ impl Engine {
             input_mode: config.kana_key_mode(),
             force_next: false,
             last_error: None,
+            english: String::new(),
+            last_henkan_ms: None,
             config,
         }
     }
@@ -424,7 +444,8 @@ impl Engine {
     pub fn set_config(&mut self, config: EngineConfig) -> Output {
         self.detector.set_config(config.detector.clone());
         self.config = config;
-        if self.input_mode == InputMode::Direct {
+        // 直接入力と英文チェックは、「かな」キーで入るモードが変わっても、そのまま続ける。
+        if matches!(self.input_mode, InputMode::Direct | InputMode::English) {
             return self.output(Step::consume());
         }
         self.set_input_mode(self.config.kana_key_mode())
@@ -445,6 +466,7 @@ impl Engine {
         self.japanese_flow = false;
         self.english_streak = 0;
         self.force_next = false;
+        self.english.clear();
     }
 
     pub fn input_mode(&self) -> InputMode {
@@ -499,6 +521,9 @@ impl Engine {
 
     /// 現在の未確定文字列。
     pub fn preedit(&self) -> String {
+        if self.input_mode == InputMode::English {
+            return self.english.clone();
+        }
         match &self.state {
             State::Direct(direct) if direct.pending => direct.word.clone(),
             State::Direct(_) => String::new(),
@@ -518,6 +543,13 @@ impl Engine {
             page: 0,
             page_count: 0,
         };
+        if self.input_mode == InputMode::English {
+            return View {
+                mode: Mode::Checking,
+                reading: self.english.clone(),
+                ..idle
+            };
+        }
         match &self.state {
             State::Direct(_) => idle,
             State::Composing { raw, .. } => View {
@@ -587,16 +619,27 @@ impl Engine {
 
     /// 打鍵を 1 つ処理する。`time_ms` は単調増加する時刻。
     pub fn handle(&mut self, key: Key, time_ms: u64) -> Output {
+        // 2 度押しを数えるのは、何も入力していない時の「かな」だけ。自動切り替えでは、入力中の「かな」は
+        // 変換と次の候補に使うので、続けて押すのが普通の操作になる。
+        let counts = key == Key::Henkan && self.input_mode != InputMode::English && self.preedit().is_empty();
+        if !counts {
+            // 間にほかのキーを挟んだ「かな」は、続けて 2 度押したことにしない。
+            self.last_henkan_ms = None;
+        } else if self.pressed_henkan_twice(time_ms) {
+            return self.set_input_mode(InputMode::English);
+        }
+        if key == Key::Muhenkan {
+            // 直接入力の時は、何も変えない。入力先へ通すと、このキーで空白を入力する入力先がある。
+            return self.set_input_mode(InputMode::Direct);
+        }
         if self.input_mode == InputMode::Direct {
             return match key {
                 Key::Henkan => self.set_input_mode(self.config.kana_key_mode()),
-                // すでに直接入力なので、何も変えない。入力先へ通すと、このキーで空白を入力する入力先がある。
-                Key::Muhenkan => self.output(Step::consume()),
                 _ => Output::default(),
             };
         }
-        if key == Key::Muhenkan {
-            return self.set_input_mode(InputMode::Direct);
+        if self.input_mode == InputMode::English {
+            return self.handle_english(key);
         }
         if key == Key::Henkan && self.input_mode != self.config.kana_key_mode() {
             // 入力ソースの一覧で、設定と違う側のモードが選ばれている。「かな」は設定の側のモードに入る。
@@ -606,6 +649,9 @@ impl Engine {
             // すでに日本語入力なので、何も変えない。
             return self.output(Step::consume());
         }
+        if let Some(output) = self.leave_japanese_for_english(key) {
+            return output;
+        }
         let state = std::mem::replace(&mut self.state, State::Direct(Direct::at_boundary()));
         let step = match state {
             State::Direct(_) if self.input_mode == InputMode::Japanese => self.japanese_idle_key(key),
@@ -614,6 +660,66 @@ impl Engine {
             State::Converting(converting) => self.handle_converting(converting, key, time_ms),
         };
         self.output(step)
+    }
+
+    /// 「かな」が押されたことを記録して、続けて 2 度押されたかどうかを返す。
+    fn pressed_henkan_twice(&mut self, time_ms: u64) -> bool {
+        let twice = self
+            .last_henkan_ms
+            .is_some_and(|last| time_ms.saturating_sub(last) <= DOUBLE_PRESS_MS);
+        // 3 度目を、次の 2 度押しの 2 度目として数えない。
+        self.last_henkan_ms = (!twice).then_some(time_ms);
+        twice
+    }
+
+    /// エンジンに渡さなかった「かな」を、2 度押しの 1 度目として数える。OS が「かな」で入力メソッドを
+    /// 選び直した直後の打鍵は、切り替えの一部としてエンジンに渡さない。
+    pub fn mark_henkan(&mut self, time_ms: u64) {
+        self.last_henkan_ms = Some(time_ms);
+    }
+
+    /// 英文チェックの打鍵。文字は英文に足し、Enter で確定する。英文が空の間は、文字以外の
+    /// キーを入力先に通す。
+    fn handle_english(&mut self, key: Key) -> Output {
+        let step = match key {
+            Key::Henkan => return self.set_input_mode(self.config.kana_key_mode()),
+            Key::Char(c) => {
+                self.english.push(c);
+                Step::consume()
+            }
+            // 英文が空の間に Esc を押したら、英文チェックをやめる。
+            Key::Escape if self.english.is_empty() => return self.set_input_mode(InputMode::Direct),
+            _ if self.english.is_empty() => Step::pass(),
+            Key::Space => {
+                self.english.push(' ');
+                Step::consume()
+            }
+            Key::Backspace => {
+                self.english.pop();
+                Step::consume()
+            }
+            Key::Enter => Step::commit(std::mem::take(&mut self.english)),
+            Key::Escape => {
+                self.english.clear();
+                Step::consume()
+            }
+            // Option や Command を付けた打鍵は、英文を確定してから入力先に通す。
+            Key::Other => Step::commit_and_pass(std::mem::take(&mut self.english)),
+            // 英文を受け取っている間は、矢印などを入力先に通さない。通すと、未確定文字列を
+            // 表示したままキャレットが動く。
+            _ => Step::consume(),
+        };
+        self.output(step)
+    }
+
+    /// 英文チェックで受け取っている英文を、訂正した文に置き換える。
+    /// 英文を受け取っていなければ何もせず、打鍵を消費しなかったことにして返す。
+    pub fn replace_english(&mut self, text: &str) -> Output {
+        if self.input_mode != InputMode::English || self.english.is_empty() {
+            return self.output(Step::pass());
+        }
+        self.english = text.to_string();
+        self.output(Step::consume())
     }
 
     fn output(&self, step: Step) -> Output {
@@ -644,6 +750,56 @@ impl Engine {
         if self.english_streak >= self.config.english_words_to_leave_japanese {
             self.japanese_flow = false;
         }
+    }
+
+    /// 日本語入力で英語を打ち始めたら、入力中の文字列を確定して直接入力にする (設定で有効な時)。
+    /// 英語を打ち始めていなければ `None`。
+    ///
+    /// 「英数」を押した時と同じく、かなは表示のとおりに確定する。違うのは、打った文字の扱い。
+    /// 大文字と記号は、直接入力にした後の打鍵として入力先に通す。ローマ字として読めない並びは、
+    /// 読める所までをかなで、残りを打ったままの英字で確定する。
+    /// 何も入力していない時のスペースも、直接入力にしてから入力先に通す。
+    /// 日本語の文の中でスペースを打つのは、たいてい英語の前だから。
+    fn leave_japanese_for_english(&mut self, key: Key) -> Option<Output> {
+        if self.input_mode != InputMode::Japanese || !self.config.leave_japanese_for_english {
+            return None;
+        }
+        let c = match key {
+            Key::Char(c) => c,
+            // 入力中のスペースは変換に使う。
+            Key::Space if self.preedit().is_empty() => ' ',
+            _ => return None,
+        };
+        let completes_rule = match &self.state {
+            State::Composing { raw, .. } => completes_rule(raw, c),
+            _ => false,
+        };
+        let step = if c == ' ' || c.is_ascii_uppercase() || (leads_english(c) && !completes_rule) {
+            let commit = match std::mem::replace(&mut self.state, State::Direct(Direct::at_boundary())) {
+                State::Converting(converting) => self.commit(converting).commit,
+                state => {
+                    self.state = state;
+                    self.preedit()
+                }
+            };
+            Step::commit_and_pass(commit)
+        } else {
+            let State::Composing { raw, .. } = &self.state else {
+                return None;
+            };
+            let mut typed = raw.clone();
+            typed.push(c);
+            // 1 文字だけでは決めない。"q" や "x" のように、単独では読めない打鍵で始まるかながある。
+            let word = typed.rsplit(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default();
+            if !c.is_ascii_lowercase() || word.len() < 2 || !RomajiTable::global().parse(word).has_unreadable() {
+                return None;
+            }
+            let (kana, letters) = RomajiTable::global().parse(&typed).split_at_unreadable();
+            Step::commit(kana + &letters)
+        };
+        self.reset();
+        self.input_mode = InputMode::Direct;
+        Some(self.output(step))
     }
 
     /// 日本語入力で、入力中の文字列が無い時の打鍵。文字のキーは、記号も含めて日本語の入力を始める。
@@ -1367,6 +1523,25 @@ fn select_katakana(segment: &mut ConvertingSegment) {
             segment.candidates.len() - 1
         }
     };
+}
+
+/// 日本語入力で打つと、続けて英語を打つと分かる記号 ("/"、"@"、"#")。
+/// ローマ字の表で日本語の記号になるもの (句読点、かぎ括弧、長音記号、波ダッシュ)、
+/// ローマ字の一部として打つ "'"、日本語の文末に付ける "!" と "?" は含めない。
+fn leads_english(c: char) -> bool {
+    c.is_ascii_punctuation() && !matches!(c, ',' | '.' | '[' | ']' | '-' | '~' | '\'' | '!' | '?')
+}
+
+/// 入力中の打鍵 `raw` に `c` を足すと、ローマ字の規則の一部になるかどうか ("z" + "/" で「・」)。
+fn completes_rule(raw: &str, c: char) -> bool {
+    let mut typed = raw.to_string();
+    typed.push(c);
+    let parsed = RomajiTable::global().parse(&typed);
+    parsed.pending.ends_with(c)
+        || parsed
+            .segments
+            .last()
+            .is_some_and(|segment| segment.converted && segment.raw.ends_with(c))
 }
 
 fn japanese_punctuation(c: char) -> char {
@@ -2933,6 +3108,499 @@ mod tests {
         // 入力中の文字列は、表示されているとおりに確定する。
         assert_eq!(simulator.text, "きょう");
         assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    fn leaving_simulator() -> Simulator {
+        Simulator::new(Engine::new(
+            sample_detector(),
+            Learning::in_memory(),
+            EngineConfig {
+                leave_japanese_for_english: true,
+                ..EngineConfig::default()
+            },
+        ))
+    }
+
+    #[test]
+    fn an_uppercase_letter_leaves_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+        simulator.run("kyouha");
+
+        // Act
+        let output = simulator.engine.handle(Key::Char('I'), 10_000);
+
+        // Assert
+        // かなは表示のとおりに確定し、大文字は直接入力の打鍵として入力先に通す。
+        assert_eq!(output.commit, "きょうは");
+        assert!(!output.consumed);
+        assert_eq!(output.preedit, "");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn an_uppercase_first_letter_leaves_japanese_input() {
+        // Arrange: 何も入力していない
+        let mut simulator = leaving_simulator();
+
+        // Act: "I " と打つ
+        let letter = simulator.engine.handle(Key::Char('I'), 10_000);
+        let space = simulator.engine.handle(Key::Space, 10_050);
+
+        // Assert
+        // 1 文字目の大文字で抜ける。大文字も続く空白も、直接入力の打鍵として入力先に通る。
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+        assert!(!letter.consumed && letter.commit.is_empty() && letter.preedit.is_empty());
+        assert!(!space.consumed);
+    }
+
+    #[test]
+    fn an_uppercase_letter_while_converting_commits_the_conversion_and_leaves() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+        simulator.run("kyouha ");
+
+        // Act
+        let output = simulator.engine.handle(Key::Char('T'), 10_000);
+
+        // Assert
+        assert_eq!(output.commit, "今日は");
+        assert!(!output.consumed);
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn letters_that_are_not_romaji_leave_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act: "pl" で始まるかなは無い
+        simulator.run("kyouhapl");
+
+        // Assert
+        // 読める所まではかな、残りは打ったままの英字で確定する。
+        assert_eq!(simulator.text, "きょうはpl");
+        assert_eq!(simulator.engine.preedit(), "");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn unreadable_letters_before_a_separator_keep_the_following_kana() {
+        for (typed, expected) in [
+            ("k,kanast", "k、かなst"),
+            ("desuk.sorehast", "ですk。それはst"),
+            ("ufok?ttd", "うふぉk?っtd"),
+            ("xt'ikanast", "xてぃかなst"),
+        ] {
+            // Arrange
+            let mut simulator = leaving_simulator();
+
+            // Act
+            simulator.run(typed);
+
+            // Assert
+            assert_eq!(simulator.text, expected, "{typed}");
+            assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+        }
+    }
+
+    #[test]
+    fn romaji_does_not_leave_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act: 促音、撥音、拗音、長音を含む入力
+        simulator.run("kocchihasinkansennnonyu-su");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+        assert_eq!(simulator.text, "こっちはしんかんせんのにゅーす");
+    }
+
+    #[test]
+    fn rare_but_finished_romaji_does_not_leave_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act: 英語の綴りに多い "th" "dh" "tw" "kw" で始まるかなと、"zh" (←)、"wi" (うぃ)
+        simulator.run("thidhitwukwazhwi");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+        assert_eq!(simulator.engine.preedit(), "てぃでぃとぅくぁ←うぃ");
+    }
+
+    #[test]
+    fn letters_outside_the_romaji_rules_leave_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act: "st" で始まるかなは無い
+        simulator.run("korehast");
+
+        // Assert
+        assert_eq!(simulator.text, "これはst");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn a_symbol_before_english_leaves_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+        simulator.run("kyouha");
+
+        // Act
+        let output = simulator.engine.handle(Key::Char('@'), 10_000);
+
+        // Assert
+        // かなは表示のとおりに確定し、記号は直接入力の打鍵として入力先に通す。
+        assert_eq!(output.commit, "きょうは");
+        assert!(!output.consumed);
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn a_symbol_with_nothing_typed_leaves_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act
+        simulator.run("#");
+
+        // Assert
+        assert_eq!(simulator.text, "#");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn japanese_symbols_do_not_leave_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act
+        simulator.run("[ra-menn~],.kan'i!?");
+
+        // Assert
+        assert_eq!(simulator.text, "「らーめん〜」、。かんい!?");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    #[test]
+    fn a_symbol_in_a_romaji_rule_does_not_leave_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act: "z/" は「・」
+        simulator.run("z/");
+
+        // Assert
+        assert_eq!(simulator.text, "・");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    #[test]
+    fn kana_after_digits_and_symbols_stays_kana_when_leaving() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act
+        simulator.run("3gatsu?korehast");
+
+        // Assert
+        assert_eq!(simulator.text, "3がつ?これはst");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn letters_after_a_wide_character_are_read_without_breaking() {
+        // Arrange: JIS キーボードの ¥ キーは、2 バイトの文字として届く
+        let mut simulator = leaving_simulator();
+
+        // Act
+        simulator.run("¥st");
+
+        // Assert
+        assert_eq!(simulator.text, "¥st");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn a_space_with_nothing_typed_leaves_japanese_input() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+        simulator.run("kyouha\n");
+
+        // Act
+        simulator.run(" ");
+
+        // Assert
+        assert_eq!(simulator.text, "きょうは ");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn a_space_while_typing_converts_instead_of_leaving() {
+        // Arrange
+        let mut simulator = leaving_simulator();
+
+        // Act
+        simulator.run("kyouha ");
+
+        // Assert
+        assert_eq!(simulator.text, "今日は");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    #[test]
+    fn japanese_input_stays_when_leaving_is_off() {
+        // Arrange: 既定では無効
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run("kyouhathI");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    #[test]
+    fn pressing_henkan_twice_starts_the_english_check() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act: 1 度目は日本語入力のまま何も変えず、続けて押した 2 度目で英文チェックになる
+        simulator.run("{henkan}{henkan}");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::English);
+        assert_eq!(simulator.text, "");
+    }
+
+    #[test]
+    fn henkan_pressed_twice_while_composing_is_not_a_double_press() {
+        // Arrange: 自動切り替えでは、入力中の「かな」は変換と次の候補
+        let mut simulator = simulator();
+        simulator.run("{henkan}.");
+
+        // Act
+        simulator.run("{henkan}{henkan}");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Auto);
+        assert_eq!(simulator.text, "…");
+    }
+
+    #[test]
+    fn a_henkan_marked_outside_the_engine_counts_as_the_first_press() {
+        // Arrange: OS が「かな」で入力メソッドを選び直した。その打鍵はエンジンに渡らない
+        let mut simulator = simulator_with(false);
+        simulator.engine.set_input_mode(InputMode::Direct);
+        simulator.engine.set_input_mode(InputMode::Japanese);
+        simulator.engine.mark_henkan(1_000);
+
+        // Act
+        simulator.engine.handle(Key::Henkan, 1_200);
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::English);
+    }
+
+    #[test]
+    fn a_slow_second_henkan_does_not_start_the_english_check() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.engine.handle(Key::Henkan, 1_000);
+
+        // Act
+        simulator.engine.handle(Key::Henkan, 1_000 + DOUBLE_PRESS_MS + 1);
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+        // 間が空いた 2 度目は、次の 2 度押しの 1 度目になる。
+        simulator.engine.handle(Key::Henkan, 1_000 + DOUBLE_PRESS_MS + 100);
+        assert_eq!(simulator.engine.input_mode(), InputMode::English);
+    }
+
+    #[test]
+    fn a_key_between_two_henkan_presses_is_not_a_double_press() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act: 400 ミリ秒の内に「かな」「a」「かな」
+        simulator.run("{henkan}a{henkan}");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+        assert_eq!(simulator.engine.preedit(), "あ");
+    }
+
+    #[test]
+    fn muhenkan_twice_stays_in_direct_input() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+
+        // Act
+        simulator.run("{muhenkan}{muhenkan}");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn a_modified_key_commits_the_text_of_the_english_check_and_passes() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}wait");
+
+        // Act: Option を付けた打鍵 (ダッシュの入力など)
+        let output = simulator.engine.handle(Key::Other, 10_000);
+
+        // Assert
+        assert_eq!(output.commit, "wait");
+        assert!(!output.consumed);
+        assert_eq!(output.preedit, "");
+        assert_eq!(simulator.engine.input_mode(), InputMode::English);
+    }
+
+    #[test]
+    fn a_config_change_keeps_the_english_check() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}pen");
+
+        // Act
+        let output = simulator.engine.set_config(EngineConfig {
+            auto_switch: true,
+            ..EngineConfig::default()
+        });
+
+        // Assert
+        assert_eq!(output.commit, "");
+        assert_eq!(simulator.engine.input_mode(), InputMode::English);
+        assert_eq!(simulator.engine.preedit(), "pen");
+    }
+
+    #[test]
+    fn replacing_without_a_text_leaves_the_key_to_the_client() {
+        // Arrange: 英文チェックで、英文をまだ受け取っていない
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}");
+
+        // Act
+        let output = simulator.engine.replace_english("I have a pen");
+
+        // Assert
+        assert!(!output.consumed);
+        assert_eq!(output.preedit, "");
+    }
+
+    #[test]
+    fn the_english_check_holds_the_text_until_enter() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}");
+
+        // Act
+        simulator.run("I has a pen");
+
+        // Assert: 入力先にはまだ出ていない
+        let view = simulator.engine.view();
+        assert_eq!(view.mode, Mode::Checking);
+        assert_eq!(view.reading, "I has a pen");
+        assert_eq!(simulator.engine.preedit(), "I has a pen");
+
+        // Act
+        simulator.run("{enter}");
+
+        // Assert
+        assert_eq!(simulator.text, "I has a pen");
+        assert_eq!(simulator.engine.preedit(), "");
+        assert_eq!(simulator.engine.input_mode(), InputMode::English);
+    }
+
+    #[test]
+    fn the_english_check_edits_and_discards_the_text() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}pens");
+
+        // Act
+        simulator.run("{bs}");
+        assert_eq!(simulator.engine.preedit(), "pen");
+        simulator.run("{esc}");
+
+        // Assert: Esc は英文を捨てるだけで、英文チェックは続く
+        assert_eq!(simulator.engine.preedit(), "");
+        assert_eq!(simulator.engine.input_mode(), InputMode::English);
+        assert_eq!(simulator.text, "");
+
+        // Act: 英文が空の時の Esc は、英文チェックをやめる
+        simulator.run("{esc}");
+
+        // Assert
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn keys_pass_through_the_english_check_while_the_text_is_empty() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}");
+
+        // Act
+        let space = simulator.engine.handle(Key::Space, 10_000);
+        let enter = simulator.engine.handle(Key::Enter, 10_050);
+
+        // Assert
+        assert!(!space.consumed);
+        assert!(!enter.consumed);
+    }
+
+    #[test]
+    fn henkan_commits_the_text_of_the_english_check_and_returns_to_japanese() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}pen");
+
+        // Act
+        simulator.run("{henkan}");
+
+        // Assert
+        assert_eq!(simulator.text, "pen");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+        // 抜けるのに押した「かな」は、次の 2 度押しの 1 度目に数えない。
+        simulator.run("{henkan}");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Japanese);
+    }
+
+    #[test]
+    fn muhenkan_commits_the_text_of_the_english_check_and_leaves_for_direct_input() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}ink");
+
+        // Act
+        let output = simulator.engine.handle(Key::Muhenkan, 100_000);
+
+        // Assert
+        assert_eq!(output.commit, "ink");
+        assert_eq!(simulator.engine.input_mode(), InputMode::Direct);
+    }
+
+    #[test]
+    fn the_text_of_the_english_check_is_replaced_by_a_correction() {
+        // Arrange
+        let mut simulator = simulator_with(false);
+        simulator.run("{henkan}{henkan}I has a pen");
+
+        // Act
+        let output = simulator.engine.replace_english("I have a pen");
+
+        // Assert
+        assert_eq!(output.preedit, "I have a pen");
+        assert_eq!(output.commit, "");
+        simulator.run("{enter}");
+        assert_eq!(simulator.text, "I have a pen");
     }
 
     #[test]

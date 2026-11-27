@@ -74,6 +74,8 @@ struct Decision {
     /// 入力先に反映する出力。キーを入力先に通す時は `None`。
     output: Option<Output>,
     mode_changed: bool,
+    /// 候補ウインドウの表示内容が変わったかどうか。文書に書かない打鍵でも、候補ウインドウは出し直す。
+    view_changed: bool,
     /// 確定を書いた後に、入力先に通すために送り直すキー。
     resend: Option<u16>,
 }
@@ -93,6 +95,8 @@ enum Edit {
     Output(Output),
     /// 表示している未確定文字列を、書き直さずに終わらせる (入力先が切り替わる時)。
     Finish,
+    /// 文書は変えずに、候補ウインドウだけを今の表示内容にする (絵文字モードを抜けてキーを通した時など)。
+    Refresh,
 }
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfCompositionSink, ITfThreadMgrEventSink, ITfCompartmentEventSink)]
@@ -273,6 +277,8 @@ impl TextService_Impl {
             match edit {
                 Edit::Output(output) => self.edit(cookie, context, &output)?,
                 Edit::Finish => self.finish(cookie, context)?,
+                // SAFETY: 編集セッションの中で、未確定文字列かキャレットの位置を読む。
+                Edit::Refresh => unsafe { self.refresh(cookie, context) },
             }
         }
         // ほかの文書の分が先頭に残った。その文書のために頼んだ編集セッションが先に動いて、何も書かずに
@@ -351,6 +357,25 @@ impl TextService_Impl {
             self.refresh_window(anchor);
         }
         Ok(())
+    }
+
+    /// 未確定文字列 (無ければキャレット) の位置に、候補ウインドウを出し直す。
+    unsafe fn refresh(&self, cookie: u32, context: &ITfContext) {
+        let composition = self.composition.borrow().clone();
+        // SAFETY: 呼び出し元は編集セッションの中。
+        let anchor = unsafe {
+            composition
+                .and_then(|composition| composition.GetRange().ok())
+                .and_then(|range| {
+                    let mut rect = RECT::default();
+                    let mut clipped = BOOL::default();
+                    let view = context.GetActiveView().ok()?;
+                    view.GetTextExt(cookie, &range, &mut rect, &mut clipped).ok()?;
+                    Some(rect)
+                })
+                .or_else(|| caret_rect(cookie, context))
+        };
+        self.refresh_window(anchor);
     }
 
     fn refresh_window(&self, anchor: Option<RECT>) {
@@ -451,8 +476,10 @@ impl TextService_Impl {
             };
             let was_direct = engine.input_mode() == InputMode::Direct;
             let preedit = engine.preedit();
+            let view = engine.view();
             let mut output = engine.handle(key, now);
             let mode_changed = was_direct != (engine.input_mode() == InputMode::Direct);
+            let view_changed = engine.view() != view;
             let writes = !output.commit.is_empty() || !output.reread.is_empty() || output.preedit != preedit;
             let mut resend = None;
             let output = if output.consumed {
@@ -475,10 +502,14 @@ impl TextService_Impl {
                 lparam: lparam.0,
                 output,
                 mode_changed,
+                view_changed,
                 resend,
             }
         };
         if !decision.eaten() {
+            if decision.view_changed {
+                self.apply(context, Edit::Refresh, true);
+            }
             if decision.mode_changed {
                 self.sync_compartment();
             }
@@ -564,8 +595,9 @@ impl TextService_Impl {
             }
             active.context.clone()
         };
+        // 未確定文字列がまだ無くても、積んである書き込みがそれを作ることがあるので、その後ろで終わらせる。
         // 借りたまま apply を呼ばない。編集セッションが同期して動くと、finish が同じ RefCell を借りる。
-        let composing = self.composition.borrow().is_some();
+        let composing = self.composition.borrow().is_some() || !self.queue.borrow().is_empty();
         if let (Some(context), true) = (context, composing) {
             self.apply(&context, Edit::Finish, false);
         }
@@ -818,35 +850,34 @@ impl ITfCompartmentEventSink_Impl for TextService_Impl {
         if guid.is_null() || unsafe { *guid } != GUID_COMPARTMENT_KEYBOARD_OPENCLOSE {
             return Ok(());
         }
-        let (thread_manager, output) = {
+        let thread_manager = {
+            let active = self.active.borrow();
+            let Some(active) = active.as_ref().filter(|active| !active.setting_compartment) else {
+                return Ok(());
+            };
+            active.thread_manager.clone()
+        };
+        // SAFETY: スレッドの compartment の値を読む。借用は返してから呼ぶ。
+        let open = unsafe {
+            thread_manager
+                .cast::<ITfCompartmentMgr>()
+                .and_then(|manager| manager.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE))
+                .and_then(|compartment| compartment.GetValue())
+                .map(|value| i32::try_from(&value).unwrap_or(0) != 0)
+        };
+        let Ok(open) = open else {
+            return Ok(());
+        };
+        let output = {
             let mut active = self.active.borrow_mut();
-            let Some(active) = active.as_mut() else {
+            let Some(engine) = active.as_mut().and_then(|active| active.engine.as_mut()) else {
                 return Ok(());
             };
-            if active.setting_compartment {
-                return Ok(());
-            }
-            let thread_manager = active.thread_manager.clone();
-            // SAFETY: スレッドの compartment の値を読む。
-            let open = unsafe {
-                thread_manager
-                    .cast::<ITfCompartmentMgr>()
-                    .and_then(|manager| manager.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE))
-                    .and_then(|compartment| compartment.GetValue())
-                    .map(|value| i32::try_from(&value).unwrap_or(0) != 0)
-            };
-            let Ok(open) = open else {
-                return Ok(());
-            };
-            let Some(engine) = active.engine.as_mut() else {
-                return Ok(());
-            };
-            let output = match (open, engine.input_mode() == InputMode::Direct) {
+            match (open, engine.input_mode() == InputMode::Direct) {
                 (true, true) => engine.set_input_mode(engine.kana_key_mode()),
                 (false, false) => engine.set_input_mode(InputMode::Direct),
                 _ => return Ok(()),
-            };
-            (thread_manager, output)
+            }
         };
         // SAFETY: フォーカスのある文書の、いちばん上のコンテキストに反映する。
         let context = unsafe { thread_manager.GetFocus().and_then(|document| document.GetTop()) };
